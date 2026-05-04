@@ -27,27 +27,34 @@ const state = {
   playbackRate: 1.0,
   bpm: 120,
   seekPosition: 0,     // 0..1
+  crossfadeDuration: 4, // seconds of crossfade between tracks
 };
 
 /* ══════════════════════════════════════
    AUDIO CONTEXT
 ══════════════════════════════════════ */
-let audioCtx     = null;
-let sourceNode   = null;   // AudioBufferSourceNode (current)
-let gainNode     = null;
-let analyserNode = null;
-let startTime    = 0;      // audioCtx.currentTime when playback started
-let startOffset  = 0;      // offset in seconds where we started
+let audioCtx        = null;
+let sourceNode      = null;   // AudioBufferSourceNode (current)
+let gainNode        = null;   // main gain for current track
+let xfadeGainNode   = null;   // gain for outgoing crossfade track
+let xfadeSourceNode = null;   // source for outgoing crossfade track
+let analyserNode    = null;
+let startTime       = 0;      // audioCtx.currentTime when playback started
+let startOffset     = 0;      // offset in seconds where we started
+let bpmTransitionId = null;   // interval ID for BPM interpolation
 
 function ensureAudioContext() {
   if (!audioCtx) {
     audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
     gainNode     = audioCtx.createGain();
+    xfadeGainNode = audioCtx.createGain();
     analyserNode = audioCtx.createAnalyser();
     analyserNode.fftSize = 256;
     gainNode.connect(analyserNode);
+    xfadeGainNode.connect(analyserNode);
     analyserNode.connect(audioCtx.destination);
     gainNode.gain.value = state.volume;
+    xfadeGainNode.gain.value = 0;
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
 }
@@ -65,7 +72,18 @@ const ui = {
   waveformIdle:    $('waveform-idle'),
   waveformCanvas:  $('waveform-canvas'),
   waveformProgress: $('waveform-progress'),
+  waveformOverlapA:$('waveform-overlap-a'),
   waveformCursor:  $('waveform-cursor'),
+
+  // Deck B (incoming)
+  deckA:           $('deck-a'),
+  deckB:           $('deck-b'),
+  deckAName:       $('deck-a-name'),
+  deckBName:       $('deck-b-name'),
+  waveformCanvasB:  $('waveform-canvas-b'),
+  waveformProgressB: $('waveform-progress-b'),
+  waveformOverlapB:$('waveform-overlap-b'),
+  waveformCursorB:  $('waveform-cursor-b'),
   wtimeStart:      $('wtime-start'),
   wtimeEnd:        $('wtime-end'),
 
@@ -76,6 +94,10 @@ const ui = {
   btnLoop:         $('btn-loop'),
 
   bpmInput:        $('bpm-input'),
+  bpmSlider:       $('bpm-slider'),
+  bpmMinus:        $('bpm-minus'),
+  bpmPlus:         $('bpm-plus'),
+  bpmOriginal:     $('bpm-original'),
   speedSlider:     $('speed-slider'),
   speedValue:      $('speed-value'),
 
@@ -92,8 +114,13 @@ const ui = {
 
   volumeSlider:    $('volume-slider'),
 
+  xfadeSlider:     $('xfade-slider'),
+  xfadeValue:      $('xfade-value'),
+
   infoCard:        $('info-card'),
   freqCanvas:      $('freq-canvas'),
+  kickLightA:      $('kick-light-a'),
+  kickLightB:      $('kick-light-b'),
 
   statusMsg:       $('status-msg'),
 };
@@ -120,6 +147,164 @@ function setStatus(msg) {
 
 function uniqueId() {
   return Math.random().toString(36).slice(2, 9);
+}
+
+/* ══════════════════════════════════════
+   BPM DETECTION — Spectral Flux + Autocorrelation
+   Multi-band energy analysis for accurate
+   tempo estimation. Returns { bpm, offset }.
+══════════════════════════════════════ */
+function detectBPM(audioBuffer) {
+  return new Promise(async (resolve) => {
+    try {
+      const sampleRate = audioBuffer.sampleRate;
+      
+      // ── Isolate Kicks using OfflineAudioContext (LowPass Filter) ──
+      // We process the first 45 seconds for an accurate average
+      const durationToProcess = Math.min(audioBuffer.duration, 45);
+      const offlineCtx = new OfflineAudioContext(1, sampleRate * durationToProcess, sampleRate);
+      
+      const source = offlineCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      
+      const filter = offlineCtx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 150; // Focus strictly on bass/kick
+      filter.Q.value = 1.0;
+      
+      source.connect(filter);
+      filter.connect(offlineCtx.destination);
+      source.start(0);
+      
+      const renderedBuffer = await offlineCtx.startRendering();
+      const lowData = renderedBuffer.getChannelData(0);
+
+      // ── Step 1 : Downsample to ~11025 Hz for speed ──
+      const factor = Math.max(1, Math.floor(sampleRate / 11025));
+      const ds = [];
+      for (let i = 0; i < lowData.length; i += factor) {
+        ds.push(lowData[i]);
+      }
+      const dsRate = sampleRate / factor;
+
+      // ── Step 2 : Compute energy in short frames ──
+      const frameSize = Math.floor(dsRate * 0.02); // 20ms frames
+      const hopSize   = Math.floor(frameSize / 2);  // 10ms hop
+      const numFrames = Math.floor((ds.length - frameSize) / hopSize);
+      const energies  = new Float32Array(numFrames);
+
+      for (let f = 0; f < numFrames; f++) {
+        const start = f * hopSize;
+        let sum = 0;
+        for (let i = 0; i < frameSize; i++) {
+          const v = ds[start + i] || 0;
+          sum += v * v;
+        }
+        energies[f] = sum;
+      }
+
+      // ── Step 3 : Spectral flux (half-wave rectified diff) ──
+      const flux = new Float32Array(numFrames);
+      for (let f = 1; f < numFrames; f++) {
+        const diff = energies[f] - energies[f - 1];
+        flux[f] = diff > 0 ? diff : 0; 
+      }
+
+      // Normalize flux
+      let maxFlux = 0;
+      for (let f = 0; f < flux.length; f++) {
+        if (flux[f] > maxFlux) maxFlux = flux[f];
+      }
+      if (maxFlux > 0) {
+        for (let f = 0; f < flux.length; f++) flux[f] /= maxFlux;
+      }
+
+      // ── Step 4 : Autocorrelation ──
+      const minBPM = 60, maxBPM = 200;
+      const framesPerSec = dsRate / hopSize;
+      const minLag = Math.floor(framesPerSec * 60 / maxBPM);
+      const maxLag = Math.floor(framesPerSec * 60 / minBPM);
+      const acLen  = Math.min(flux.length, maxLag + 1);
+
+      let bestLag = minLag;
+      let bestCorr = -Infinity;
+
+      for (let lag = minLag; lag <= Math.min(maxLag, acLen - 1); lag++) {
+        let corr = 0;
+        for (let i = 0; i < flux.length - lag; i++) {
+          corr += flux[i] * flux[i + lag];
+        }
+        corr /= (flux.length - lag) || 1;
+
+        // Weight toward common tempos (bias toward 100-160 BPM range)
+        const bpmAtLag = (framesPerSec * 60) / lag;
+        const centerBPM = 128;
+        const weight = 1.0 - 0.3 * Math.abs(bpmAtLag - centerBPM) / 80;
+        corr *= Math.max(weight, 0.5);
+
+        if (corr > bestCorr) {
+          bestCorr = corr;
+          bestLag = lag;
+        }
+      }
+
+      let bpm = Math.round((framesPerSec * 60) / bestLag);
+
+      // ── Step 5 : Octave correction ──
+      const halfLag = bestLag * 2;
+      const doubleLag = Math.floor(bestLag / 2);
+
+      if (halfLag < acLen) {
+        let halfCorr = 0;
+        for (let i = 0; i < flux.length - halfLag; i++) {
+          halfCorr += flux[i] * flux[i + halfLag];
+        }
+        halfCorr /= (flux.length - halfLag) || 1;
+        if (halfCorr > bestCorr * 0.85 && bpm > 160) {
+          bpm = Math.round(bpm / 2);
+          bestCorr = halfCorr;
+        }
+      }
+      if (doubleLag >= minLag) {
+        let dblCorr = 0;
+        for (let i = 0; i < flux.length - doubleLag; i++) {
+          dblCorr += flux[i] * flux[i + doubleLag];
+        }
+        dblCorr /= (flux.length - doubleLag) || 1;
+        if (dblCorr > bestCorr * 0.85 && bpm < 80) {
+          bpm = Math.round(bpm * 2);
+        }
+      }
+
+      // ── Step 6 : Find first beat offset ──
+      // Now that the flux contains exclusively low frequencies (kicks),
+      // finding the maximum phase alignment is extremely accurate.
+      const periodFrames = Math.round((framesPerSec * 60) / bpm);
+      let bestPhase = 0;
+      let bestPhaseScore = -Infinity;
+
+      for (let phase = 0; phase < periodFrames && phase < flux.length; phase++) {
+        let score = 0;
+        for (let k = phase; k < flux.length; k += periodFrames) {
+          // Emphasize strong kicks
+          score += Math.pow(flux[k], 2);
+        }
+        if (score > bestPhaseScore) {
+          bestPhaseScore = score;
+          bestPhase = phase;
+        }
+      }
+
+      const offset = (bestPhase * hopSize * factor) / sampleRate;
+
+      bpm = Math.max(20, Math.min(300, bpm));
+
+      resolve({ bpm, offset });
+    } catch (e) {
+      console.warn('BPM detection failed:', e);
+      resolve(null);
+    }
+  });
 }
 
 /* ══════════════════════════════════════
@@ -154,11 +339,33 @@ async function importFiles(files) {
         duration: audioBuffer.duration,
         sampleRate: audioBuffer.sampleRate,
         channels:   audioBuffer.numberOfChannels,
+        detectedBPM: null,
+        beatOffset: 0,       // offset to the first beat in seconds
       };
 
       state.tracks.push(track);
       renderTrackItem(track);
-      setStatus(`✔ ${track.name} chargé (${formatTime(track.duration)})`);
+      setStatus(`✔ ${track.name} chargé — Analyse du tempo…`);
+
+      // BPM detection (async, non-blocking)
+      detectBPM(audioBuffer).then(result => {
+        if (result) {
+          track.detectedBPM = result.bpm;
+          track.beatOffset  = result.offset;
+          setStatus(`✔ ${track.name} — ${result.bpm} BPM (offset: ${result.offset.toFixed(2)}s)`);
+          // Auto-apply if this is the active track
+          if (state.tracks[state.currentIndex]?.id === track.id) {
+            updateBPM(result.bpm);
+            updateInfoPanel(track);
+          }
+          // Re-render to show BPM in queue
+          ui.trackList.innerHTML = '';
+          state.tracks.forEach(t => renderTrackItem(t));
+          updateActiveTrackUI();
+        } else {
+          setStatus(`✔ ${track.name} chargé (tempo non détecté)`);
+        }
+      });
 
       // Auto-load first track
       if (state.tracks.length === 1) {
@@ -174,6 +381,8 @@ async function importFiles(files) {
 /* ══════════════════════════════════════
    PLAYLIST RENDERING
 ══════════════════════════════════════ */
+let draggedItemIndex = null;
+
 function renderTrackItem(track) {
   const li = document.createElement('li');
   li.className = 'track-item';
@@ -181,13 +390,16 @@ function renderTrackItem(track) {
   li.setAttribute('role', 'option');
   li.setAttribute('aria-selected', 'false');
 
+  const idx = state.tracks.indexOf(track);
   const icon = track.ext === 'WAV' ? '🔊' : '🎵';
+  const bpmTag = track.detectedBPM ? ` · ${track.detectedBPM}bpm` : '';
 
   li.innerHTML = `
+    <div class="track-item__pos">${idx + 1}</div>
     <div class="track-item__icon">${icon}</div>
     <div class="track-item__info">
       <div class="track-item__name" title="${track.name}">${track.name}</div>
-      <div class="track-item__meta">${track.ext} · ${formatTime(track.duration)}</div>
+      <div class="track-item__meta">${track.ext} · ${formatTime(track.duration)}${bpmTag}</div>
     </div>
     <button class="track-item__remove" title="Retirer" data-remove="${track.id}" aria-label="Retirer ${track.name}">✕</button>
   `;
@@ -201,6 +413,67 @@ function renderTrackItem(track) {
   li.querySelector('[data-remove]').addEventListener('click', (e) => {
     e.stopPropagation();
     removeTrack(track.id);
+  });
+
+  // ── DRAG & DROP REORDERING ──
+  li.draggable = true;
+  
+  li.addEventListener('dragstart', (e) => {
+    draggedItemIndex = Array.from(ui.trackList.children).indexOf(li);
+    e.dataTransfer.effectAllowed = 'move';
+    li.style.opacity = '0.4';
+  });
+
+  li.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    li.style.borderTop = '2px solid var(--accent-bright)';
+  });
+
+  li.addEventListener('dragleave', () => {
+    li.style.borderTop = 'none';
+  });
+
+  li.addEventListener('drop', (e) => {
+    e.preventDefault();
+    li.style.borderTop = 'none';
+    const targetIndex = Array.from(ui.trackList.children).indexOf(li);
+    
+    if (draggedItemIndex !== null && draggedItemIndex !== targetIndex) {
+      const draggedTrack = state.tracks.splice(draggedItemIndex, 1)[0];
+      state.tracks.splice(targetIndex, 0, draggedTrack);
+      
+      // Update currentIndex if affected
+      if (state.currentIndex === draggedItemIndex) {
+        state.currentIndex = targetIndex;
+      } else if (state.currentIndex > draggedItemIndex && state.currentIndex <= targetIndex) {
+        state.currentIndex--;
+      } else if (state.currentIndex < draggedItemIndex && state.currentIndex >= targetIndex) {
+        state.currentIndex++;
+      }
+      
+      // Re-render
+      ui.trackList.innerHTML = '';
+      state.tracks.forEach(t => renderTrackItem(t));
+      updateActiveTrackUI();
+      
+      // Deck B preview might change
+      const nextIndex = state.currentIndex + 1;
+      const nextTrack = state.tracks[nextIndex];
+      if (nextTrack && !_crossfading) {
+        drawWaveformB(nextTrack);
+        ui.deckBName.textContent = nextTrack.name;
+        ui.deckB.classList.add('deck--inactive');
+        ui.deckB.classList.remove('deck--active');
+      } else if (!nextTrack && !_crossfading) {
+        hideDeckB();
+      }
+    }
+  });
+
+  li.addEventListener('dragend', () => {
+    li.style.opacity = '1';
+    draggedItemIndex = null;
   });
 
   ui.trackList.appendChild(li);
@@ -255,12 +528,12 @@ function removeTrack(id) {
 /* ══════════════════════════════════════
    TRACK LOADING
 ══════════════════════════════════════ */
-function loadTrack(index) {
+function loadTrack(index, { crossfade = false } = {}) {
   if (index < 0 || index >= state.tracks.length) return;
 
-  stopPlayback();
+  if (!crossfade) stopPlayback();
   state.currentIndex = index;
-  startOffset = 0;
+  if (!crossfade) startOffset = 0;
 
   const track = state.tracks[index];
 
@@ -271,18 +544,37 @@ function loadTrack(index) {
   ui.wtimeStart.textContent        = '0:00';
 
   // Seek / progress reset
-  updateSeek(0);
+  if (!crossfade) updateSeek(0);
 
-  // Waveform
-  drawWaveform(track.buffer);
+  // Waveform on Deck A
+  if (!crossfade) {
+    drawWaveform(track);
+    ui.deckAName.textContent = track.name;
+    hideDeckB();
+    // Preview next track on Deck B
+    const nextTrack = state.tracks[index + 1];
+    if (nextTrack) {
+      drawWaveformB(nextTrack);
+      ui.deckBName.textContent = nextTrack.name;
+      ui.deckB.classList.add('deck--inactive');
+      ui.deckB.classList.remove('deck--active');
+    }
+  }
 
   // Info panel
   updateInfoPanel(track);
 
+  // Auto-apply detected BPM if available (instant if no crossfade)
+  if (track.detectedBPM && !crossfade) {
+    updateBPM(track.detectedBPM);
+  }
+
   // UI active state
   updateActiveTrackUI();
 
-  setStatus(`Piste chargée : ${track.name}`);
+  setStatus(track.detectedBPM
+    ? `Piste chargée : ${track.name} — ${track.detectedBPM} BPM`
+    : `Piste chargée : ${track.name}`);
 }
 
 /* ══════════════════════════════════════
@@ -290,6 +582,7 @@ function loadTrack(index) {
 ══════════════════════════════════════ */
 function startPlayback(offset = 0) {
   ensureAudioContext();
+  _crossfading = false;
 
   if (state.currentIndex === -1) return;
   const track = state.tracks[state.currentIndex];
@@ -307,6 +600,10 @@ function startPlayback(offset = 0) {
   sourceNode.loop   = state.isLooping;
   sourceNode.playbackRate.value = state.playbackRate;
   sourceNode.connect(gainNode);
+
+  // Ensure main gain is at full volume
+  gainNode.gain.cancelScheduledValues(audioCtx.currentTime);
+  gainNode.gain.setValueAtTime(state.volume, audioCtx.currentTime);
 
   startOffset = Math.min(offset, track.duration);
   startTime   = audioCtx.currentTime;
@@ -333,6 +630,8 @@ function pausePlayback() {
     sourceNode.onended = null;
     try { sourceNode.stop(); } catch(_) {}
   }
+  // Also stop any crossfade source
+  cleanupCrossfade();
   state.isPlaying = false;
   setPlayPauseIcon(false);
   updateActiveTrackUI();
@@ -345,10 +644,238 @@ function stopPlayback() {
     sourceNode.disconnect();
     sourceNode = null;
   }
+  cleanupCrossfade();
+  _crossfading = false;
   state.isPlaying = false;
   startOffset = 0;
   setPlayPauseIcon(false);
   updateActiveTrackUI();
+}
+
+function cleanupCrossfade() {
+  if (xfadeSourceNode) {
+    try { xfadeSourceNode.stop(); } catch(_) {}
+    xfadeSourceNode.disconnect();
+    xfadeSourceNode = null;
+  }
+  if (xfadeGainNode) {
+    xfadeGainNode.gain.cancelScheduledValues(audioCtx?.currentTime || 0);
+    xfadeGainNode.gain.value = 0;
+  }
+  if (bpmTransitionId) {
+    clearInterval(bpmTransitionId);
+    bpmTransitionId = null;
+  }
+}
+
+/**
+ * DJ-style crossfade transition to next track:
+ *
+ * Phase 1 — Tempo Sync (first half of crossfade):
+ *   The outgoing track's playback rate ramps toward the incoming
+ *   track's BPM so both tracks are beat-matched at the midpoint.
+ *
+ * Phase 2 — Overlap / Crossfade (full duration):
+ *   Both tracks play simultaneously with equal-power gain curves
+ *   (cos/sin) for a smooth energy transition.
+ *
+ * Phase 3 — Tempo Settle (second half):
+ *   The incoming track started at the synced rate and gradually
+ *   returns to 1.0x (its natural tempo).
+ *
+ * The BPM display smoothly interpolates throughout.
+ */
+/**
+ * DJ-style crossfade transition to next track:
+ * Track 1 fades out but keeps its original tempo.
+ * Track 2 fades in and ramps its tempo from Track 1's BPM to its own natural BPM during the crossfade.
+ */
+function crossfadeToNext() {
+  const nextIndex = state.currentIndex + 1;
+  if (nextIndex >= state.tracks.length) {
+    handleTrackEnded();
+    return;
+  }
+
+  ensureAudioContext();
+  const dur = Math.max(state.crossfadeDuration, 0.5); // minimum 0.5s
+  const now = audioCtx.currentTime;
+  const prevTrack = state.tracks[state.currentIndex];
+  const nextTrack = state.tracks[nextIndex];
+  const prevBPM = prevTrack?.detectedBPM || state.bpm;
+  const nextBPM = nextTrack?.detectedBPM || prevBPM;
+
+  const currentRate = state.playbackRate; 
+
+  // Track 2 matches Track 1's tempo for the entire crossfade duration
+  const incomingSyncRate = (prevBPM * currentRate) / nextBPM;
+  const clampedIncomingRate = Math.max(0.5, Math.min(2.0, incomingSyncRate));
+
+  // ── PHASE SYNC (Beatmatching) ──
+  let syncDelay = 0;
+  if (prevTrack.detectedBPM && nextTrack.detectedBPM) {
+    const ct = getCurrentTime();
+    const beatInterval1 = 60 / prevTrack.detectedBPM;
+    
+    // Find phase of track 1
+    // modulo can be negative in JS if ct < offset, so we add beatInterval1
+    let currentPhase1 = (ct - prevTrack.beatOffset) % beatInterval1;
+    if (currentPhase1 < 0) currentPhase1 += beatInterval1;
+    
+    let timeToNextBeat1 = (beatInterval1 - currentPhase1) / currentRate; // Real time
+    
+    const timeToFirstBeat2 = nextTrack.beatOffset / clampedIncomingRate; // Real time
+
+    // Find the next available beat of track 1 that can accommodate track 2's offset
+    while (timeToNextBeat1 < timeToFirstBeat2) {
+      timeToNextBeat1 += (beatInterval1 / currentRate);
+    }
+    syncDelay = timeToNextBeat1 - timeToFirstBeat2;
+    
+    // If delay is too long (e.g., more than 1 beat), we could subtract a beat, 
+    // but the while loop ensures it's the *closest* next beat.
+  }
+  
+  const startXfadeTime = now + syncDelay;
+
+  _xfadeOutgoingTrack = prevTrack;
+  _xfadeOutgoingStartOffset = getCurrentTime();
+  _xfadeOutgoingStartTime = now;
+  _xfadeOutgoingRate = currentRate;
+
+  // ── 1. Move outgoing source to crossfade gain ──
+  if (sourceNode) {
+    sourceNode.onended = null;
+    try { sourceNode.disconnect(); } catch(_) {}
+    sourceNode.connect(xfadeGainNode);
+
+    // Track 1 fades out (more pronounced curve)
+    xfadeGainNode.gain.cancelScheduledValues(now);
+    xfadeGainNode.gain.setValueAtTime(state.volume, now);
+    xfadeGainNode.gain.setValueAtTime(state.volume, startXfadeTime);
+    
+    const fadeSteps = 20;
+    for (let i = 1; i <= fadeSteps; i++) {
+      const t = i / fadeSteps;
+      // Math.pow for a more pronounced (steeper) fade-out
+      const gain = state.volume * Math.pow(Math.cos(t * Math.PI * 0.5), 1.5);
+      xfadeGainNode.gain.linearRampToValueAtTime(
+        Math.max(gain, 0.001), startXfadeTime + t * dur
+      );
+    }
+
+    // Track 1 keeps its current tempo
+    sourceNode.playbackRate.cancelScheduledValues(now);
+    sourceNode.playbackRate.setValueAtTime(currentRate, now);
+
+    // Auto-cleanup outgoing source after crossfade
+    const outgoing = sourceNode;
+    setTimeout(() => {
+      try { outgoing.stop(); outgoing.disconnect(); } catch(_) {}
+      if (xfadeSourceNode === outgoing) xfadeSourceNode = null;
+    }, (syncDelay + dur) * 1000 + 500);
+    xfadeSourceNode = sourceNode;
+    sourceNode = null;
+  }
+
+  // ── 2. Start incoming track ──
+  drawWaveformB(nextTrack);
+  ui.deckBName.textContent = nextTrack.name;
+
+  loadTrack(nextIndex, { crossfade: true });
+  startOffset = 0;
+
+  sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = nextTrack.buffer;
+  sourceNode.loop   = state.isLooping;
+
+  sourceNode.playbackRate.setValueAtTime(clampedIncomingRate, now);
+  // Track 2 adjusts to its natural tempo DURING the crossfade
+  sourceNode.playbackRate.setValueAtTime(clampedIncomingRate, startXfadeTime);
+  sourceNode.playbackRate.linearRampToValueAtTime(1.0, startXfadeTime + dur);
+
+  sourceNode.connect(gainNode);
+
+  // Fade-in: steeper curve
+  gainNode.gain.cancelScheduledValues(now);
+  gainNode.gain.setValueAtTime(0.001, now);
+  gainNode.gain.setValueAtTime(0.001, startXfadeTime);
+  
+  const fadeSteps = 20;
+  for (let i = 1; i <= fadeSteps; i++) {
+    const t = i / fadeSteps;
+    const gain = state.volume * Math.pow(Math.sin(t * Math.PI * 0.5), 1.5);
+    gainNode.gain.linearRampToValueAtTime(Math.max(gain, 0.001), startXfadeTime + t * dur);
+  }
+
+  startTime = startXfadeTime; // Update global start time for seek/progress
+  sourceNode.start(startXfadeTime, 0);
+
+  state.isPlaying = true;
+  setPlayPauseIcon(true);
+  updateActiveTrackUI();
+
+  sourceNode.onended = () => {
+    if (state.isPlaying && !state.isLooping) {
+      handleTrackEnded();
+    }
+  };
+
+  startRenderLoop();
+
+  // ── 3. Smooth BPM display interpolation ──
+  if (bpmTransitionId) clearInterval(bpmTransitionId);
+  const totalDur = dur;
+  const steps = Math.floor(totalDur * 20); // 20fps
+  const intervalTime = (totalDur * 1000) / steps;
+  let step = 0;
+  
+  // Wait until syncDelay finishes before starting the UI interpolation
+  setTimeout(() => {
+    bpmTransitionId = setInterval(() => {
+      step++;
+      const t = step / steps;
+      
+      _updatingTempo = true;
+
+      const ease = t * t * (3 - 2 * t);
+      const currentDisplayRate = clampedIncomingRate + (1.0 - clampedIncomingRate) * ease;
+      const currentDisplayBPM = Math.round(prevBPM + (nextBPM - prevBPM) * ease);
+
+      state.bpm = currentDisplayBPM;
+      ui.bpmInput.value = currentDisplayBPM;
+      ui.bpmSlider.value = currentDisplayBPM;
+
+      ui.speedValue.textContent = `${currentDisplayRate.toFixed(2)}x`;
+      ui.speedSlider.value = currentDisplayRate;
+
+      _updatingTempo = false;
+
+      if (step >= steps) {
+        clearInterval(bpmTransitionId);
+        bpmTransitionId = null;
+        state.playbackRate = 1.0;
+        ui.speedSlider.value = 1.0;
+        ui.speedValue.textContent = '1.00x';
+        updateBPM(nextBPM);
+
+        _crossfading = false;
+        drawWaveform(nextTrack);
+        ui.deckAName.textContent = nextTrack.name;
+        hideDeckB();
+
+        const futureTrack = state.tracks[nextIndex + 1];
+        if (futureTrack) {
+          drawWaveformB(futureTrack);
+          ui.deckBName.textContent = futureTrack.name;
+          ui.deckB.classList.add('deck--inactive');
+          ui.deckB.classList.remove('deck--active');
+        }
+      }
+    }, intervalTime);
+  }, syncDelay * 1000);
+
+  setStatus(`🎧 Transition → ${nextTrack.name} (Sync: ${syncDelay.toFixed(2)}s)`);
 }
 
 function handleTrackEnded() {
@@ -420,10 +947,15 @@ function showWaveformIdle() {
 }
 
 function updateInfoPanel(track) {
+  const bpmDisplay = track.detectedBPM
+    ? `<span class="info-value info-value--accent">${track.detectedBPM} BPM</span>`
+    : `<span class="info-value info-value--dim">Analyse…</span>`;
+
   ui.infoCard.innerHTML = `
     <div class="info-row"><span class="info-label">Fichier</span><span class="info-value">${track.name.slice(0, 18)}${track.name.length > 18 ? '…' : ''}</span></div>
     <div class="info-row"><span class="info-label">Format</span><span class="info-value">${track.ext}</span></div>
     <div class="info-row"><span class="info-label">Durée</span><span class="info-value">${formatTime(track.duration)}</span></div>
+    <div class="info-row"><span class="info-label">Tempo</span>${bpmDisplay}</div>
     <div class="info-row"><span class="info-label">Taille</span><span class="info-value">${formatBytes(track.size)}</span></div>
     <div class="info-row"><span class="info-label">Sample rate</span><span class="info-value">${(track.sampleRate / 1000).toFixed(1)} kHz</span></div>
     <div class="info-row"><span class="info-label">Canaux</span><span class="info-value">${track.channels === 2 ? 'Stéréo' : 'Mono'}</span></div>
@@ -433,12 +965,8 @@ function updateInfoPanel(track) {
 /* ══════════════════════════════════════
    WAVEFORM RENDERING
 ══════════════════════════════════════ */
-function drawWaveform(buffer) {
-  ui.waveformIdle.classList.add('hidden');
-  ui.waveformCanvas.classList.add('visible');
-  ui.waveformCursor.classList.add('visible');
-
-  const canvas = ui.waveformCanvas;
+function drawWaveformOnCanvas(track, canvas, colorScheme = 'purple') {
+  const buffer = track.buffer;
   const dpr    = window.devicePixelRatio || 1;
   canvas.width  = canvas.offsetWidth  * dpr;
   canvas.height = canvas.offsetHeight * dpr;
@@ -449,12 +977,10 @@ function drawWaveform(buffer) {
   const cW = canvas.offsetWidth;
   const cH = canvas.offsetHeight;
 
-  // Use averaged channels
   const rawData   = buffer.getChannelData(0);
   const samples   = cW * 2;
   const blockSize = Math.floor(rawData.length / samples);
 
-  // Calculate peaks
   const peaks = [];
   for (let i = 0; i < samples; i++) {
     const start = i * blockSize;
@@ -467,10 +993,10 @@ function drawWaveform(buffer) {
     peaks.push({ min, max });
   }
 
-  // Clear
   ctx.clearRect(0, 0, cW, cH);
 
-  // Background subtle grid horizontal center
+
+
   ctx.strokeStyle = 'rgba(255,255,255,0.04)';
   ctx.lineWidth   = 1;
   ctx.beginPath();
@@ -478,9 +1004,19 @@ function drawWaveform(buffer) {
   ctx.lineTo(cW, cH / 2);
   ctx.stroke();
 
-  // Draw waveform bars
   const barW = cW / samples;
   const mid  = cH / 2;
+
+  // Color palettes
+  const colors = colorScheme === 'green' ? {
+    high:    ['rgba(240,109,109,0.9)', 'rgba(240,109,109,0.5)'],
+    mid:     ['rgba(62,207,142,0.85)', 'rgba(46,180,120,0.5)'],
+    low:     ['rgba(62,207,142,0.7)',  'rgba(46,160,110,0.4)'],
+  } : {
+    high:    ['rgba(240,109,109,0.9)', 'rgba(240,109,109,0.5)'],
+    mid:     ['rgba(157,145,255,0.85)', 'rgba(124,108,248,0.5)'],
+    low:     ['rgba(124,108,248,0.7)',  'rgba(62,207,142,0.4)'],
+  };
 
   for (let i = 0; i < samples; i++) {
     const x      = i * barW;
@@ -489,29 +1025,183 @@ function drawWaveform(buffer) {
     const yBot   = mid + max * mid * 0.92;
     const height = Math.max(yBot - yTop, 1);
 
-    // Color gradient by amplitude
     const amp = Math.max(Math.abs(min), Math.abs(max));
     const g   = ctx.createLinearGradient(0, yTop, 0, yBot);
-    if (amp > 0.8) {
-      g.addColorStop(0, 'rgba(240,109,109,0.9)');
-      g.addColorStop(1, 'rgba(240,109,109,0.5)');
-    } else if (amp > 0.5) {
-      g.addColorStop(0, 'rgba(157,145,255,0.85)');
-      g.addColorStop(1, 'rgba(124,108,248,0.5)');
-    } else {
-      g.addColorStop(0, 'rgba(124,108,248,0.7)');
-      g.addColorStop(1, 'rgba(62,207,142,0.4)');
-    }
+    const pal = amp > 0.8 ? colors.high : amp > 0.5 ? colors.mid : colors.low;
+    g.addColorStop(0, pal[0]);
+    g.addColorStop(1, pal[1]);
 
     ctx.fillStyle = g;
     ctx.fillRect(x, yTop, Math.max(barW - 0.5, 0.5), height);
   }
+
+  // Draw beat grid (kicks) over the waveform
+  if (track.detectedBPM && track.beatOffset !== undefined) {
+    const beatInterval = 60 / track.detectedBPM;
+    const offset = track.beatOffset;
+    let beatCount = 0;
+    
+    for (let t = offset; t < buffer.duration; t += beatInterval) {
+      const x = (t / buffer.duration) * cW;
+      const isDownbeat = (beatCount % 4 === 0);
+      
+      // Full height subtle line
+      ctx.beginPath();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = isDownbeat 
+        ? (colorScheme === 'green' ? 'rgba(62,207,142,0.15)' : 'rgba(157,145,255,0.15)')
+        : 'rgba(255,255,255,0.03)';
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, cH);
+      ctx.stroke();
+
+      // Clearer tick at the bottom (like a ruler)
+      ctx.beginPath();
+      ctx.lineWidth = isDownbeat ? 2 : 1;
+      ctx.strokeStyle = isDownbeat 
+        ? (colorScheme === 'green' ? 'rgba(62,207,142,0.8)' : 'rgba(157,145,255,0.8)')
+        : 'rgba(255,255,255,0.4)';
+      const tickHeight = isDownbeat ? 14 : 8;
+      ctx.moveTo(x, cH - tickHeight);
+      ctx.lineTo(x, cH);
+      ctx.stroke();
+
+      // Clearer tick at the top
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, tickHeight);
+      ctx.stroke();
+      
+      beatCount++;
+    }
+  }
+}
+
+function updateOverlapUI() {
+  const dur = state.crossfadeDuration;
+  
+  // Deck A (Outgoing) - Overlap is at the END of the track
+  const trackA = state.tracks[state.currentIndex];
+  if (trackA && ui.waveformCanvas.classList.contains('visible')) {
+    const totalA = trackA.duration;
+    const overlapPercentA = Math.min((dur / totalA) * 100, 100);
+    ui.waveformOverlapA.style.width = `${overlapPercentA}%`;
+    ui.waveformOverlapA.classList.add('visible');
+  } else {
+    ui.waveformOverlapA.classList.remove('visible');
+  }
+
+  // Deck B (Incoming) - Overlap is at the BEGINNING of the track
+  const nextIndex = state.currentIndex + 1;
+  const trackB = state.tracks[nextIndex];
+  if (trackB && ui.deckB.classList.contains('deck--active')) {
+    const totalB = trackB.duration;
+    const overlapPercentB = Math.min((dur / totalB) * 100, 100);
+    ui.waveformOverlapB.style.width = `${overlapPercentB}%`;
+    ui.waveformOverlapB.classList.add('visible');
+  } else {
+    ui.waveformOverlapB.classList.remove('visible');
+  }
+}
+
+function drawWaveform(track) {
+  if (!track) return;
+  ui.waveformIdle.classList.add('hidden');
+  ui.waveformCanvas.classList.add('visible');
+  ui.waveformCursor.classList.add('visible');
+  drawWaveformOnCanvas(track, ui.waveformCanvas, 'purple');
+  updateOverlapUI();
+}
+
+function drawWaveformB(track) {
+  if (!track) return;
+  ui.waveformCanvasB.classList.add('visible');
+  ui.waveformCursorB.classList.add('visible');
+  ui.deckB.classList.remove('deck--inactive');
+  ui.deckB.classList.add('deck--active');
+  drawWaveformOnCanvas(track, ui.waveformCanvasB, 'green');
+  updateOverlapUI();
+}
+
+function hideDeckB() {
+  ui.deckB.classList.add('deck--inactive');
+  ui.deckB.classList.remove('deck--active');
+  ui.waveformCanvasB.classList.remove('visible');
+  ui.waveformCursorB.classList.remove('visible');
+  ui.waveformProgressB.style.width = '0%';
+  ui.waveformCursorB.style.left = '0%';
+  ui.deckBName.textContent = '—';
+  updateOverlapUI();
 }
 
 /* ══════════════════════════════════════
    FREQUENCY VISUALIZER
 ══════════════════════════════════════ */
 let rafId = null;
+let _crossfading = false;
+let _tempoRamping = false;
+let _xfadeOutgoingTrack = null;
+let _xfadeOutgoingStartOffset = 0;
+let _xfadeOutgoingStartTime = 0;
+let _xfadeOutgoingRate = 1.0;
+
+let _lastBeatA = -1;
+let _lastBeatB = -1;
+
+function checkKicks() {
+  if (!state.isPlaying) {
+    _lastBeatA = -1;
+    _lastBeatB = -1;
+    return;
+  }
+
+  const now = audioCtx ? audioCtx.currentTime : 0;
+
+  // Deck A (Currently playing track, or Outgoing track during crossfade)
+  const trackA = _crossfading ? _xfadeOutgoingTrack : state.tracks[state.currentIndex];
+  if (trackA && trackA.detectedBPM) {
+    let ctA = 0;
+    let rateA = 1.0;
+    if (_crossfading) {
+      ctA = now - _xfadeOutgoingStartTime + _xfadeOutgoingStartOffset;
+      rateA = _xfadeOutgoingRate;
+    } else {
+      ctA = now - startTime + startOffset;
+      rateA = state.playbackRate;
+    }
+    
+    // Internal track time
+    const internalTimeA = ctA * rateA;
+    const beatIntervalA = 60 / trackA.detectedBPM;
+    const currentBeatA = Math.floor((internalTimeA - trackA.beatOffset) / beatIntervalA);
+    
+    if (currentBeatA > _lastBeatA) {
+      _lastBeatA = currentBeatA;
+      ui.kickLightA.classList.add('flash');
+      setTimeout(() => ui.kickLightA.classList.remove('flash'), 80);
+    }
+  }
+
+  // Deck B
+  const trackB = _crossfading ? state.tracks[state.currentIndex] : null;
+  if (trackB && trackB.detectedBPM && _crossfading && sourceNode) {
+    let ctB = now - startTime; 
+    if (ctB >= 0) {
+      const rateB = sourceNode.playbackRate.value;
+      const internalTimeB = ctB * rateB; 
+      const beatIntervalB = 60 / trackB.detectedBPM;
+      const currentBeatB = Math.floor((internalTimeB - trackB.beatOffset) / beatIntervalB);
+      
+      if (currentBeatB > _lastBeatB) {
+        _lastBeatB = currentBeatB;
+        ui.kickLightB.classList.add('flash');
+        setTimeout(() => ui.kickLightB.classList.remove('flash'), 80);
+      }
+    }
+  } else {
+    _lastBeatB = -1;
+  }
+}
 
 function startRenderLoop() {
   if (rafId) cancelAnimationFrame(rafId);
@@ -535,9 +1225,36 @@ function startRenderLoop() {
       if (track) {
         const ct    = getCurrentTime();
         const ratio = Math.min(ct / track.duration, 1);
-        updateSeek(ratio);
+
+        if (_crossfading && _xfadeOutgoingTrack) {
+          // Deck A (Outgoing) continues from where it was
+          // We roughly estimate outgoing time progress
+          const outgoingElapsed = (audioCtx.currentTime - _xfadeOutgoingStartTime) * _xfadeOutgoingRate;
+          const outgoingCt = _xfadeOutgoingStartOffset + outgoingElapsed;
+          const outgoingRatio = Math.min(outgoingCt / _xfadeOutgoingTrack.duration, 1);
+          
+          ui.waveformProgress.style.width = `${outgoingRatio * 100}%`;
+          ui.waveformCursor.style.left    = `${outgoingRatio * 100}%`;
+          ui.seekFill.style.width         = `${outgoingRatio * 100}%`;
+          ui.seekThumb.style.left         = `${outgoingRatio * 100}%`;
+          
+          // Deck B (Incoming) uses the new track's time
+          ui.waveformProgressB.style.width = `${ratio * 100}%`;
+          ui.waveformCursorB.style.left    = `${ratio * 100}%`;
+        } else {
+          updateSeek(ratio);
+        }
+
         ui.wtimeStart.textContent = formatTime(ct);
         ui.timeDisplay.textContent = `${formatTime(ct)} / ${formatTime(track.duration)}`;
+
+        // ── Crossfade trigger ──
+        const timeLeft = track.duration - ct;
+        const hasNext = state.currentIndex < state.tracks.length - 1;
+        if (hasNext && !state.isLooping && !_crossfading && timeLeft > 0 && timeLeft <= state.crossfadeDuration) {
+          _crossfading = true;
+          crossfadeToNext();
+        }
 
         if (ct >= track.duration && !state.isLooping) {
           cancelAnimationFrame(rafId);
@@ -545,6 +1262,8 @@ function startRenderLoop() {
         }
       }
     }
+
+    checkKicks();
 
     // ── Frequency bars ──
     if (!analyserNode) return;
@@ -656,8 +1375,12 @@ ui.btnPrev.addEventListener('click', () => {
 
 ui.btnNext.addEventListener('click', () => {
   if (state.currentIndex < state.tracks.length - 1) {
-    loadTrack(state.currentIndex + 1);
-    if (state.isPlaying) startPlayback(0);
+    if (state.isPlaying) {
+      _crossfading = true;
+      crossfadeToNext();
+    } else {
+      loadTrack(state.currentIndex + 1);
+    }
   }
 });
 
@@ -705,24 +1428,100 @@ ui.waveformCanvas.addEventListener('click', e => {
 });
 
 /* ══════════════════════════════════════
-   TEMPO & SPEED
+   TEMPO & SPEED — Linked together
+   BPM change → adjusts playback speed
+   Speed change → adjusts BPM display
 ══════════════════════════════════════ */
-ui.speedSlider.addEventListener('input', () => {
-  state.playbackRate = parseFloat(ui.speedSlider.value);
-  ui.speedValue.textContent = `${state.playbackRate.toFixed(2)}x`;
-  
+let _updatingTempo = false; // guard against circular updates
+
+function getOriginalBPM() {
+  if (state.currentIndex === -1) return state.bpm;
+  const track = state.tracks[state.currentIndex];
+  return track?.detectedBPM || state.bpm;
+}
+
+function applyPlaybackRate(rate) {
+  state.playbackRate = rate;
+  ui.speedSlider.value = rate;
+  ui.speedValue.textContent = `${rate.toFixed(2)}x`;
   if (sourceNode) {
-    // Smoothly transition playback rate to avoid clicks
-    sourceNode.playbackRate.setTargetAtTime(state.playbackRate, audioCtx.currentTime, 0.05);
+    sourceNode.playbackRate.setTargetAtTime(rate, audioCtx.currentTime, 0.05);
   }
+}
+
+function updateBPM(val) {
+  if (_updatingTempo) return;
+  _updatingTempo = true;
+
+  state.bpm = Math.max(20, Math.min(300, Math.round(val)));
+  ui.bpmInput.value = state.bpm;
+  ui.bpmSlider.value = state.bpm;
+
+  // Calculate and apply the corresponding playback speed
+  const originalBPM = getOriginalBPM();
+  const newRate = Math.max(0.5, Math.min(2.0, state.bpm / originalBPM));
+  applyPlaybackRate(newRate);
+
+  setStatus(`Tempo : ${state.bpm} BPM · Vitesse : ${newRate.toFixed(2)}x`);
+  _updatingTempo = false;
+}
+
+function updateSpeedFromSlider(rate) {
+  if (_updatingTempo) return;
+  _updatingTempo = true;
+
+  state.playbackRate = rate;
+  ui.speedValue.textContent = `${rate.toFixed(2)}x`;
+  if (sourceNode) {
+    sourceNode.playbackRate.setTargetAtTime(rate, audioCtx.currentTime, 0.05);
+  }
+
+  // Calculate and apply the corresponding BPM
+  const originalBPM = getOriginalBPM();
+  const newBPM = Math.max(20, Math.min(300, Math.round(originalBPM * rate)));
+  state.bpm = newBPM;
+  ui.bpmInput.value = newBPM;
+  ui.bpmSlider.value = newBPM;
+
+  setStatus(`Tempo : ${newBPM} BPM · Vitesse : ${rate.toFixed(2)}x`);
+  _updatingTempo = false;
+}
+
+// ── Speed slider ──
+ui.speedSlider.addEventListener('input', () => {
+  updateSpeedFromSlider(parseFloat(ui.speedSlider.value));
 });
 
+// ── BPM controls ──
 ui.bpmInput.addEventListener('change', () => {
-  let val = parseInt(ui.bpmInput.value);
-  if (isNaN(val)) val = 120;
-  state.bpm = Math.max(20, Math.min(300, val));
-  ui.bpmInput.value = state.bpm;
-  setStatus(`Tempo du projet : ${state.bpm} BPM`);
+  updateBPM(parseInt(ui.bpmInput.value) || 120);
+});
+
+ui.bpmSlider.addEventListener('input', () => {
+  updateBPM(parseInt(ui.bpmSlider.value));
+});
+
+ui.bpmMinus.addEventListener('click', () => {
+  updateBPM(state.bpm - 1);
+});
+
+ui.bpmPlus.addEventListener('click', () => {
+  updateBPM(state.bpm + 1);
+});
+
+// ── Original button ──
+ui.bpmOriginal.addEventListener('click', () => {
+  const originalBPM = getOriginalBPM();
+  _updatingTempo = true;
+
+  state.bpm = originalBPM;
+  ui.bpmInput.value = originalBPM;
+  ui.bpmSlider.value = originalBPM;
+
+  applyPlaybackRate(1.0);
+
+  _updatingTempo = false;
+  setStatus(`Tempo original restauré : ${originalBPM} BPM · 1.00x`);
 });
 
 /* ══════════════════════════════════════
@@ -731,6 +1530,15 @@ ui.bpmInput.addEventListener('change', () => {
 ui.volumeSlider.addEventListener('input', () => {
   state.volume = parseFloat(ui.volumeSlider.value);
   if (gainNode) gainNode.gain.value = state.volume;
+});
+
+/* ══════════════════════════════════════
+   CROSSFADE DURATION
+══════════════════════════════════════ */
+ui.xfadeSlider.addEventListener('input', () => {
+  state.crossfadeDuration = parseFloat(ui.xfadeSlider.value);
+  ui.xfadeValue.textContent = `${state.crossfadeDuration.toFixed(1)}s`;
+  updateOverlapUI();
 });
 
 /* ══════════════════════════════════════
@@ -773,7 +1581,7 @@ document.addEventListener('keydown', e => {
 const resizeObserver = new ResizeObserver(() => {
   if (state.currentIndex !== -1) {
     const track = state.tracks[state.currentIndex];
-    if (track) drawWaveform(track.buffer);
+    if (track) drawWaveform(track);
   }
 });
 resizeObserver.observe(ui.waveformCanvas.parentElement);
