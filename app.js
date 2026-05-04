@@ -1088,8 +1088,8 @@ function drawWaveformOnCanvas(track, canvas, colorScheme = 'purple') {
     low:     ['rgba(62,207,142,0.7)',  'rgba(46,160,110,0.4)'],
   } : {
     high:    ['rgba(240,109,109,0.9)', 'rgba(240,109,109,0.5)'],
-    mid:     ['rgba(157,145,255,0.85)', 'rgba(124,108,248,0.5)'],
-    low:     ['rgba(124,108,248,0.7)',  'rgba(62,207,142,0.4)'],
+    mid:     ['rgba(207,159,255,0.85)', 'rgba(165,94,234,0.5)'],
+    low:     ['rgba(165,94,234,0.7)',  'rgba(165,94,234,0.4)'],
   };
 
   for (let i = 0; i < samples; i++) {
@@ -1123,7 +1123,7 @@ function drawWaveformOnCanvas(track, canvas, colorScheme = 'purple') {
       ctx.beginPath();
       ctx.lineWidth = 1;
       ctx.strokeStyle = isDownbeat 
-        ? (colorScheme === 'green' ? 'rgba(62,207,142,0.15)' : 'rgba(157,145,255,0.15)')
+        ? (colorScheme === 'green' ? 'rgba(62,207,142,0.15)' : 'rgba(207,159,255,0.15)')
         : 'rgba(255,255,255,0.03)';
       ctx.moveTo(x, 0);
       ctx.lineTo(x, cH);
@@ -1133,7 +1133,7 @@ function drawWaveformOnCanvas(track, canvas, colorScheme = 'purple') {
       ctx.beginPath();
       ctx.lineWidth = isDownbeat ? 2 : 1;
       ctx.strokeStyle = isDownbeat 
-        ? (colorScheme === 'green' ? 'rgba(62,207,142,0.8)' : 'rgba(157,145,255,0.8)')
+        ? (colorScheme === 'green' ? 'rgba(62,207,142,0.8)' : 'rgba(207,159,255,0.8)')
         : 'rgba(255,255,255,0.4)';
       const tickHeight = isDownbeat ? 14 : 8;
       ctx.moveTo(x, cH - tickHeight);

@@ -15,10 +15,10 @@
   --border:         rgba(255,255,255,0.06);
   --border-subtle:  rgba(255,255,255,0.04);
 
-  --accent:         #7c6cf8;
-  --accent-bright:  #9d91ff;
-  --accent-dim:     rgba(124, 108, 248, 0.18);
-  --accent-glow:    rgba(124, 108, 248, 0.35);
+  --accent:         #a55eea;
+  --accent-bright:  #cf9fff;
+  --accent-dim:     rgba(165, 94, 234, 0.18);
+  --accent-glow:    rgba(165, 94, 234, 0.45);
 
   --green:          #3ecf8e;
   --red:            #f06c6c;
