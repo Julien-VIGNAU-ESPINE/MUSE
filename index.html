@@ -100,6 +100,23 @@
 
       <!-- Waveform display — Dual Decks -->
       <div class="decks-container" id="decks-container">
+        <!-- Sync HUD -->
+        <div class="sync-hud" id="sync-hud">
+          <div class="sync-hud__deck">
+            <span class="sync-hud__bpm" id="sync-bpm-a">--</span>
+            <span class="sync-hud__label">DECK A</span>
+          </div>
+          <div class="sync-hud__center">
+            <div class="sync-hud__arrow" id="sync-arrow">↔</div>
+            <div class="sync-hud__status" id="sync-status-label">READY</div>
+            <div class="sync-hud__progress-bar"><div class="sync-hud__progress-fill" id="sync-progress"></div></div>
+          </div>
+          <div class="sync-hud__deck">
+            <span class="sync-hud__bpm" id="sync-bpm-b">--</span>
+            <span class="sync-hud__label">DECK B</span>
+          </div>
+        </div>
+
         <!-- Deck A (current / outgoing) -->
         <div class="deck" id="deck-a">
           <div class="deck__label"><span class="deck__badge deck__badge--a">A</span><span class="deck__name"

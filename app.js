@@ -119,6 +119,12 @@ const ui = {
   xfadeSlider:     $('xfade-slider'),
   xfadeValue:      $('xfade-value'),
 
+  syncBpmA:        $('sync-bpm-a'),
+  syncBpmB:        $('sync-bpm-b'),
+  syncArrow:       $('sync-arrow'),
+  syncStatus:      $('sync-status-label'),
+  syncProgress:    $('sync-progress'),
+
   infoCard:        $('info-card'),
   freqCanvas:      $('freq-canvas'),
   kickLightA:      $('kick-light-a'),
@@ -733,6 +739,9 @@ function crossfadeToNext() {
 
   const incomingSyncRate = targetBPMForB / nextBPM;
   const clampedIncomingRate = Math.max(0.1, Math.min(10.0, incomingSyncRate));
+  
+  _clampedIncomingRate = clampedIncomingRate;
+  _finalRateForB = finalRateForB;
 
   // ── PHASE SYNC (Beatmatching) ──
   let syncDelay = 0;
@@ -854,6 +863,13 @@ function crossfadeToNext() {
   const rampStartRealTime = startXfadeTime + dur * 0.5; 
   const rampEndRealTime = startXfadeTime + dur * 1.5;
   
+  // HUD Initial state
+  ui.syncBpmA.textContent = Math.round(track1BPM);
+  ui.syncBpmB.textContent = Math.round(targetBPMForB);
+  ui.syncStatus.textContent = 'PHASE 1: LOCK';
+  ui.syncArrow.textContent = '↔';
+  ui.syncArrow.className = 'sync-hud__arrow lock';
+  
   bpmTransitionId = setInterval(() => {
     const currentNow = audioCtx.currentTime;
     
@@ -868,6 +884,9 @@ function crossfadeToNext() {
       ui.bpmSlider.value = displayBPM;
       ui.speedValue.textContent = `${clampedIncomingRate.toFixed(2)}x`;
       ui.speedSlider.value = clampedIncomingRate;
+      
+      const p = Math.max(0, (currentNow - startXfadeTime) / (dur * 1.5));
+      ui.syncProgress.style.width = `${(p * 100).toFixed(1)}%`;
       return;
     }
     
@@ -876,6 +895,7 @@ function crossfadeToNext() {
     const t = Math.min(1.0, (currentNow - rampStartRealTime) / rampDur);
     
     _updatingTempo = true;
+
     const ease = t * t * (3 - 2 * t);
     const currentDisplayRate = clampedIncomingRate + (finalRateForB - clampedIncomingRate) * ease;
     const currentDisplayBPM = Math.round(currentSyncedBPM + (finalBPMForB - currentSyncedBPM) * ease);
@@ -886,6 +906,23 @@ function crossfadeToNext() {
 
     ui.speedValue.textContent = `${currentDisplayRate.toFixed(2)}x`;
     ui.speedSlider.value = currentDisplayRate;
+    
+    // Update HUD during ramp
+    ui.syncBpmB.textContent = currentDisplayBPM;
+    ui.syncStatus.textContent = 'PHASE 2: RAMP';
+    if (finalBPMForB > currentSyncedBPM) {
+      ui.syncArrow.textContent = '▲';
+      ui.syncArrow.className = 'sync-hud__arrow up';
+    } else if (finalBPMForB < currentSyncedBPM) {
+      ui.syncArrow.textContent = '▼';
+      ui.syncArrow.className = 'sync-hud__arrow down';
+    } else {
+      ui.syncArrow.textContent = '↔';
+      ui.syncArrow.className = 'sync-hud__arrow lock';
+    }
+    
+    const pTotal = Math.min(1.0, (currentNow - startXfadeTime) / (dur * 1.5));
+    ui.syncProgress.style.width = `${(pTotal * 100).toFixed(1)}%`;
 
     _updatingTempo = false;
 
@@ -1182,6 +1219,9 @@ let _xfadeOutgoingStartOffset = 0;
 let _xfadeOutgoingStartTime = 0;
 let _xfadeOutgoingRate = 1.0;
 
+let _clampedIncomingRate = 1.0;
+let _finalRateForB = 1.0;
+
 let _lastBeatA = -1;
 let _lastBeatB = -1;
 
@@ -1194,21 +1234,20 @@ function checkKicks() {
 
   const now = audioCtx ? audioCtx.currentTime : 0;
 
-  // Deck A (Currently playing track, or Outgoing track during crossfade)
+  // Deck A 
   const trackA = _crossfading ? _xfadeOutgoingTrack : state.tracks[state.currentIndex];
   if (trackA && trackA.detectedBPM) {
     let ctA = 0;
     let rateA = 1.0;
     if (_crossfading) {
-      ctA = now - _xfadeOutgoingStartTime + _xfadeOutgoingStartOffset;
+      ctA = now - _xfadeOutgoingStartTime;
       rateA = _xfadeOutgoingRate;
     } else {
-      ctA = now - startTime + startOffset;
+      ctA = now - startTime;
       rateA = state.playbackRate;
     }
     
-    // Internal track time
-    const internalTimeA = ctA * rateA;
+    const internalTimeA = (_crossfading ? _xfadeOutgoingStartOffset : startOffset) + ctA * rateA;
     const beatIntervalA = 60 / trackA.detectedBPM;
     const currentBeatA = Math.floor((internalTimeA - trackA.beatOffset) / beatIntervalA);
     
@@ -1217,23 +1256,57 @@ function checkKicks() {
       ui.kickLightA.classList.add('flash');
       setTimeout(() => ui.kickLightA.classList.remove('flash'), 80);
     }
+
+    if (!_crossfading) {
+      ui.syncBpmA.textContent = Math.round(trackA.detectedBPM * rateA);
+      ui.syncBpmB.textContent = '--';
+      ui.syncStatus.textContent = 'READY';
+      ui.syncArrow.textContent = '●';
+      ui.syncArrow.className = 'sync-hud__arrow';
+      ui.syncProgress.style.width = '0%';
+    }
   }
 
   // Deck B
   const trackB = _crossfading ? state.tracks[state.currentIndex] : null;
   if (trackB && trackB.detectedBPM && _crossfading && sourceNode) {
-    let ctB = now - startTime; 
-    if (ctB >= 0) {
-      const rateB = sourceNode.playbackRate.value;
-      const internalTimeB = startOffset + ctB * rateB; 
-      const beatIntervalB = 60 / trackB.detectedBPM;
-      const currentBeatB = Math.floor((internalTimeB - trackB.beatOffset) / beatIntervalB);
-      
-      if (currentBeatB > _lastBeatB) {
-        _lastBeatB = currentBeatB;
-        ui.kickLightB.classList.add('flash');
-        setTimeout(() => ui.kickLightB.classList.remove('flash'), 80);
-      }
+    const elapsedRealTime = now - startTime; 
+    
+    // Calculate precise internal time by integrating playbackRate
+    // We know the ramp starts at startTime + dur * 0.5
+    const dur = state.crossfadeDuration;
+    const rampStart = dur * 0.5;
+    const rampEnd = dur * 1.5;
+    
+    let internalTimeB = startOffset;
+    const initialRate = _clampedIncomingRate; // Need to store this globally
+    const finalRate = _finalRateForB; // Need to store this globally
+    
+    if (elapsedRealTime < rampStart) {
+      // Phase 1: Constant synced rate
+      internalTimeB += elapsedRealTime * initialRate;
+    } else if (elapsedRealTime < rampEnd) {
+      // Phase 2: Ramping
+      const tRamp = elapsedRealTime - rampStart;
+      const rampDur = rampEnd - rampStart;
+      // Integral of linear ramp: r0*t + 0.5 * (r1-r0)/D * t^2
+      internalTimeB += rampStart * initialRate;
+      internalTimeB += initialRate * tRamp + 0.5 * (finalRate - initialRate) / rampDur * (tRamp * tRamp);
+    } else {
+      // Phase 3: Constant final rate
+      const rampDur = rampEnd - rampStart;
+      internalTimeB += rampStart * initialRate;
+      internalTimeB += 0.5 * (initialRate + finalRate) * rampDur; // Total integral during ramp
+      internalTimeB += (elapsedRealTime - rampEnd) * finalRate;
+    }
+
+    const beatIntervalB = 60 / trackB.detectedBPM;
+    const currentBeatB = Math.floor((internalTimeB - trackB.beatOffset) / beatIntervalB);
+    
+    if (currentBeatB > _lastBeatB) {
+      _lastBeatB = currentBeatB;
+      ui.kickLightB.classList.add('flash');
+      setTimeout(() => ui.kickLightB.classList.remove('flash'), 80);
     }
   } else {
     _lastBeatB = -1;
