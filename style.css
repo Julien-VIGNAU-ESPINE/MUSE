@@ -873,6 +873,33 @@ html, body {
   justify-content: center;
 }
 
+.bpm-limit-btn {
+  background: var(--surface-light);
+  border: 1px solid var(--border-color);
+  color: var(--text-dim);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-left: 8px;
+}
+
+.bpm-limit-btn:hover {
+  background: var(--surface-lighter);
+  color: var(--text-main);
+}
+
+.bpm-limit-btn.btn--active {
+  background: var(--accent-bright);
+  border-color: var(--accent-bright);
+  color: white;
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
 .kick-indicator {
   display: flex;
   align-items: center;

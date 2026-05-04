@@ -27,6 +27,7 @@ const state = {
   playbackRate: 1.0,
   bpm: 120,
   seekPosition: 0,     // 0..1
+  isSyncLimitActive: true, // Enabled by default
   crossfadeDuration: 4, // seconds of crossfade between tracks
 };
 
@@ -98,6 +99,7 @@ const ui = {
   bpmMinus:        $('bpm-minus'),
   bpmPlus:         $('bpm-plus'),
   bpmOriginal:     $('bpm-original'),
+  syncLimit:       $('sync-limit'),
   speedSlider:     $('speed-slider'),
   speedValue:      $('speed-value'),
 
@@ -295,7 +297,24 @@ function detectBPM(audioBuffer) {
         }
       }
 
-      const offset = (bestPhase * hopSize * factor) / sampleRate;
+      const approximateOffset = (bestPhase * hopSize * factor) / sampleRate;
+
+      // Refine offset to the exact sample maximum in the low-passed data!
+      const windowSamples = Math.floor(sampleRate * 0.02); 
+      const startSample = Math.max(0, Math.floor(approximateOffset * sampleRate) - windowSamples);
+      const endSample = Math.min(lowData.length, Math.floor(approximateOffset * sampleRate) + windowSamples);
+      
+      let maxEnergy = 0;
+      let exactPeakSample = Math.floor(approximateOffset * sampleRate);
+      for (let i = startSample; i < endSample; i++) {
+        const energy = Math.abs(lowData[i]);
+        if (energy > maxEnergy) {
+          maxEnergy = energy;
+          exactPeakSample = i;
+        }
+      }
+      
+      const offset = exactPeakSample / sampleRate;
 
       bpm = Math.max(20, Math.min(300, bpm));
 
@@ -670,23 +689,6 @@ function cleanupCrossfade() {
 
 /**
  * DJ-style crossfade transition to next track:
- *
- * Phase 1 — Tempo Sync (first half of crossfade):
- *   The outgoing track's playback rate ramps toward the incoming
- *   track's BPM so both tracks are beat-matched at the midpoint.
- *
- * Phase 2 — Overlap / Crossfade (full duration):
- *   Both tracks play simultaneously with equal-power gain curves
- *   (cos/sin) for a smooth energy transition.
- *
- * Phase 3 — Tempo Settle (second half):
- *   The incoming track started at the synced rate and gradually
- *   returns to 1.0x (its natural tempo).
- *
- * The BPM display smoothly interpolates throughout.
- */
-/**
- * DJ-style crossfade transition to next track:
  * Track 1 fades out but keeps its original tempo.
  * Track 2 fades in and ramps its tempo from Track 1's BPM to its own natural BPM during the crossfade.
  */
@@ -708,32 +710,50 @@ function crossfadeToNext() {
   const currentRate = state.playbackRate; 
 
   // Track 2 matches Track 1's tempo for the entire crossfade duration
-  const incomingSyncRate = (prevBPM * currentRate) / nextBPM;
-  const clampedIncomingRate = Math.max(0.5, Math.min(2.0, incomingSyncRate));
+  const track1BPM = prevBPM * currentRate;
+  let targetBPMForB = track1BPM;
+
+  // Apply Sync Limit if active: 
+  // If difference is > 10 BPM, we limit the adjustment so 10 BPM of difference remains.
+  // User example: A=140, B=100 => B=130 (10 BPM remaining gap)
+  if (state.isSyncLimitActive) {
+    const diff = track1BPM - nextTrack.detectedBPM;
+    if (Math.abs(diff) > 10) {
+      targetBPMForB = track1BPM - (Math.sign(diff) * 10);
+    }
+  }
+
+  // Calculate the final target BPM for Track B (it must not exceed +/- 10 BPM of Track A)
+  // Even after the ramp, B stays within 10 BPM of A's tempo.
+  let finalBPMForB = nextBPM;
+  if (state.isSyncLimitActive) {
+    finalBPMForB = Math.max(track1BPM - 10, Math.min(track1BPM + 10, nextBPM));
+  }
+  const finalRateForB = finalBPMForB / nextBPM;
+
+  const incomingSyncRate = targetBPMForB / nextBPM;
+  const clampedIncomingRate = Math.max(0.1, Math.min(10.0, incomingSyncRate));
 
   // ── PHASE SYNC (Beatmatching) ──
   let syncDelay = 0;
+  let startOffsetB = 0;
+
   if (prevTrack.detectedBPM && nextTrack.detectedBPM) {
-    const ct = getCurrentTime();
+    // Exact internal audio time of Track 1
+    const elapsedRealTime = now - startTime;
+    const internalTime1 = startOffset + elapsedRealTime * currentRate;
+    
     const beatInterval1 = 60 / prevTrack.detectedBPM;
     
-    // Find phase of track 1
-    // modulo can be negative in JS if ct < offset, so we add beatInterval1
-    let currentPhase1 = (ct - prevTrack.beatOffset) % beatInterval1;
+    // Find phase in audio time
+    let currentPhase1 = (internalTime1 - prevTrack.beatOffset) % beatInterval1;
     if (currentPhase1 < 0) currentPhase1 += beatInterval1;
     
-    let timeToNextBeat1 = (beatInterval1 - currentPhase1) / currentRate; // Real time
+    // Real time until the next beat of Track 1
+    syncDelay = (beatInterval1 - currentPhase1) / currentRate;
     
-    const timeToFirstBeat2 = nextTrack.beatOffset / clampedIncomingRate; // Real time
-
-    // Find the next available beat of track 1 that can accommodate track 2's offset
-    while (timeToNextBeat1 < timeToFirstBeat2) {
-      timeToNextBeat1 += (beatInterval1 / currentRate);
-    }
-    syncDelay = timeToNextBeat1 - timeToFirstBeat2;
-    
-    // If delay is too long (e.g., more than 1 beat), we could subtract a beat, 
-    // but the while loop ensures it's the *closest* next beat.
+    // Cue Track 2 EXACTLY on its first beat
+    startOffsetB = nextTrack.beatOffset; 
   }
   
   const startXfadeTime = now + syncDelay;
@@ -749,7 +769,7 @@ function crossfadeToNext() {
     try { sourceNode.disconnect(); } catch(_) {}
     sourceNode.connect(xfadeGainNode);
 
-    // Track 1 fades out (more pronounced curve)
+    // Track 1 fades out over the full crossfade duration
     xfadeGainNode.gain.cancelScheduledValues(now);
     xfadeGainNode.gain.setValueAtTime(state.volume, now);
     xfadeGainNode.gain.setValueAtTime(state.volume, startXfadeTime);
@@ -757,23 +777,23 @@ function crossfadeToNext() {
     const fadeSteps = 20;
     for (let i = 1; i <= fadeSteps; i++) {
       const t = i / fadeSteps;
-      // Math.pow for a more pronounced (steeper) fade-out
       const gain = state.volume * Math.pow(Math.cos(t * Math.PI * 0.5), 1.5);
       xfadeGainNode.gain.linearRampToValueAtTime(
         Math.max(gain, 0.001), startXfadeTime + t * dur
       );
     }
 
-    // Track 1 keeps its current tempo
+    // Track 1 maintains its exact tempo
     sourceNode.playbackRate.cancelScheduledValues(now);
     sourceNode.playbackRate.setValueAtTime(currentRate, now);
 
     // Auto-cleanup outgoing source after crossfade
     const outgoing = sourceNode;
+    const stopTime = startXfadeTime + dur;
     setTimeout(() => {
       try { outgoing.stop(); outgoing.disconnect(); } catch(_) {}
       if (xfadeSourceNode === outgoing) xfadeSourceNode = null;
-    }, (syncDelay + dur) * 1000 + 500);
+    }, (stopTime - now) * 1000 + 100);
     xfadeSourceNode = sourceNode;
     sourceNode = null;
   }
@@ -783,16 +803,19 @@ function crossfadeToNext() {
   ui.deckBName.textContent = nextTrack.name;
 
   loadTrack(nextIndex, { crossfade: true });
-  startOffset = 0;
+  startOffset = startOffsetB;
 
   sourceNode = audioCtx.createBufferSource();
   sourceNode.buffer = nextTrack.buffer;
   sourceNode.loop   = state.isLooping;
 
   sourceNode.playbackRate.setValueAtTime(clampedIncomingRate, now);
-  // Track 2 adjusts to its natural tempo DURING the crossfade
-  sourceNode.playbackRate.setValueAtTime(clampedIncomingRate, startXfadeTime);
-  sourceNode.playbackRate.linearRampToValueAtTime(1.0, startXfadeTime + dur);
+  // Track 2 stays locked to synced tempo for the first 50% of the transition
+  const rampStartTime = startXfadeTime + dur * 0.5;
+  const rampEndTime = startXfadeTime + dur * 1.5; 
+  sourceNode.playbackRate.setValueAtTime(clampedIncomingRate, rampStartTime);
+  // THEN it adjusts toward final target (natural or limited)
+  sourceNode.playbackRate.linearRampToValueAtTime(finalRateForB, rampEndTime);
 
   sourceNode.connect(gainNode);
 
@@ -808,8 +831,8 @@ function crossfadeToNext() {
     gainNode.gain.linearRampToValueAtTime(Math.max(gain, 0.001), startXfadeTime + t * dur);
   }
 
-  startTime = startXfadeTime; // Update global start time for seek/progress
-  sourceNode.start(startXfadeTime, 0);
+  startTime = startXfadeTime; 
+  sourceNode.start(startXfadeTime, startOffsetB);
 
   state.isPlaying = true;
   setPlayPauseIcon(true);
@@ -825,55 +848,69 @@ function crossfadeToNext() {
 
   // ── 3. Smooth BPM display interpolation ──
   if (bpmTransitionId) clearInterval(bpmTransitionId);
-  const totalDur = dur;
-  const steps = Math.floor(totalDur * 20); // 20fps
-  const intervalTime = (totalDur * 1000) / steps;
-  let step = 0;
+  const totalUIDur = dur * 1.5; 
+  const steps = Math.floor(totalUIDur * 20); // 20fps
   
-  // Wait until syncDelay finishes before starting the UI interpolation
-  setTimeout(() => {
-    bpmTransitionId = setInterval(() => {
-      step++;
-      const t = step / steps;
-      
-      _updatingTempo = true;
+  const rampStartRealTime = startXfadeTime + dur * 0.5; 
+  const rampEndRealTime = startXfadeTime + dur * 1.5;
+  
+  bpmTransitionId = setInterval(() => {
+    const currentNow = audioCtx.currentTime;
+    
+    // Calculate the BPM we are actually synced to (considering limit)
+    const currentSyncedBPM = targetBPMForB; 
 
-      const ease = t * t * (3 - 2 * t);
-      const currentDisplayRate = clampedIncomingRate + (1.0 - clampedIncomingRate) * ease;
-      const currentDisplayBPM = Math.round(prevBPM + (nextBPM - prevBPM) * ease);
+    if (currentNow < rampStartRealTime) {
+      // Still in phase 1 (locked tempo)
+      const displayBPM = Math.round(currentSyncedBPM);
+      state.bpm = displayBPM;
+      ui.bpmInput.value = displayBPM;
+      ui.bpmSlider.value = displayBPM;
+      ui.speedValue.textContent = `${clampedIncomingRate.toFixed(2)}x`;
+      ui.speedSlider.value = clampedIncomingRate;
+      return;
+    }
+    
+    // Tempo transition phase (50% to 150% of crossfade)
+    const rampDur = rampEndRealTime - rampStartRealTime;
+    const t = Math.min(1.0, (currentNow - rampStartRealTime) / rampDur);
+    
+    _updatingTempo = true;
+    const ease = t * t * (3 - 2 * t);
+    const currentDisplayRate = clampedIncomingRate + (finalRateForB - clampedIncomingRate) * ease;
+    const currentDisplayBPM = Math.round(currentSyncedBPM + (finalBPMForB - currentSyncedBPM) * ease);
 
-      state.bpm = currentDisplayBPM;
-      ui.bpmInput.value = currentDisplayBPM;
-      ui.bpmSlider.value = currentDisplayBPM;
+    state.bpm = currentDisplayBPM;
+    ui.bpmInput.value = currentDisplayBPM;
+    ui.bpmSlider.value = currentDisplayBPM;
 
-      ui.speedValue.textContent = `${currentDisplayRate.toFixed(2)}x`;
-      ui.speedSlider.value = currentDisplayRate;
+    ui.speedValue.textContent = `${currentDisplayRate.toFixed(2)}x`;
+    ui.speedSlider.value = currentDisplayRate;
 
-      _updatingTempo = false;
+    _updatingTempo = false;
 
-      if (step >= steps) {
-        clearInterval(bpmTransitionId);
-        bpmTransitionId = null;
-        state.playbackRate = 1.0;
-        ui.speedSlider.value = 1.0;
-        ui.speedValue.textContent = '1.00x';
-        updateBPM(nextBPM);
+    if (t >= 1.0) {
+      clearInterval(bpmTransitionId);
+      bpmTransitionId = null;
+      state.playbackRate = finalRateForB;
+      ui.speedSlider.value = finalRateForB;
+      ui.speedValue.textContent = `${finalRateForB.toFixed(2)}x`;
+      updateBPM(finalBPMForB);
 
-        _crossfading = false;
-        drawWaveform(nextTrack);
-        ui.deckAName.textContent = nextTrack.name;
-        hideDeckB();
+      _crossfading = false;
+      drawWaveform(nextTrack);
+      ui.deckAName.textContent = nextTrack.name;
+      hideDeckB();
 
-        const futureTrack = state.tracks[nextIndex + 1];
-        if (futureTrack) {
-          drawWaveformB(futureTrack);
-          ui.deckBName.textContent = futureTrack.name;
-          ui.deckB.classList.add('deck--inactive');
-          ui.deckB.classList.remove('deck--active');
-        }
+      const futureTrack = state.tracks[nextIndex + 1];
+      if (futureTrack) {
+        drawWaveformB(futureTrack);
+        ui.deckBName.textContent = futureTrack.name;
+        ui.deckB.classList.add('deck--inactive');
+        ui.deckB.classList.remove('deck--active');
       }
-    }, intervalTime);
-  }, syncDelay * 1000);
+    }
+  }, 50);
 
   setStatus(`🎧 Transition → ${nextTrack.name} (Sync: ${syncDelay.toFixed(2)}s)`);
 }
@@ -1188,7 +1225,7 @@ function checkKicks() {
     let ctB = now - startTime; 
     if (ctB >= 0) {
       const rateB = sourceNode.playbackRate.value;
-      const internalTimeB = ctB * rateB; 
+      const internalTimeB = startOffset + ctB * rateB; 
       const beatIntervalB = 60 / trackB.detectedBPM;
       const currentBeatB = Math.floor((internalTimeB - trackB.beatOffset) / beatIntervalB);
       
@@ -1497,8 +1534,16 @@ ui.bpmInput.addEventListener('change', () => {
   updateBPM(parseInt(ui.bpmInput.value) || 120);
 });
 
-ui.bpmSlider.addEventListener('input', () => {
-  updateBPM(parseInt(ui.bpmSlider.value));
+ui.bpmSlider.addEventListener('input', (e) => {
+  if (_updatingTempo) return;
+  const val = parseFloat(e.target.value);
+  updateBPM(val);
+});
+
+ui.syncLimit.addEventListener('click', () => {
+  state.isSyncLimitActive = !state.isSyncLimitActive;
+  ui.syncLimit.classList.toggle('btn--active', state.isSyncLimitActive);
+  setStatus(state.isSyncLimitActive ? "Limite Sync 10 BPM activée" : "Limite Sync désactivée");
 });
 
 ui.bpmMinus.addEventListener('click', () => {
