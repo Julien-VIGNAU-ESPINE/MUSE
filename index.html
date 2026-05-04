@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Muse — Web DAW</title>
+  <meta name="description" content="Muse est un studio audio en ligne. Chargez et jouez vos fichiers MP3 et WAV directement dans le navigateur." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ══════════════ TOPBAR ══════════════ -->
+  <header class="topbar">
+    <div class="topbar__logo">
+      <span class="topbar__logo-icon">𝄞</span>
+      <span class="topbar__logo-name">Muse</span>
+      <span class="topbar__version">v0.1</span>
+    </div>
+    <nav class="topbar__nav">
+      <button class="nav-btn active" id="nav-player">Player</button>
+      <button class="nav-btn disabled" title="Bientôt disponible">Mixer</button>
+      <button class="nav-btn disabled" title="Bientôt disponible">Piano Roll</button>
+      <button class="nav-btn disabled" title="Bientôt disponible">Séquenceur</button>
+    </nav>
+    <div class="topbar__actions">
+      <div class="bpm-display">
+        <label for="bpm-input" class="bpm-label">BPM</label>
+        <input type="number" id="bpm-input" class="bpm-input" value="120" min="20" max="300" step="1" />
+      </div>
+    </div>
+  </header>
+
+  <!-- ══════════════ MAIN LAYOUT ══════════════ -->
+  <main class="workspace">
+
+    <!-- ── LEFT PANEL : Playlist ── -->
+    <aside class="panel panel--left" id="playlist-panel">
+      <div class="panel__header">
+        <h2 class="panel__title">Playlist</h2>
+        <label class="btn-import" for="file-input" title="Importer des fichiers audio">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Ajouter
+        </label>
+        <input type="file" id="file-input" accept=".mp3,.wav,audio/mpeg,audio/wav" multiple hidden />
+      </div>
+
+      <!-- Drop zone -->
+      <div class="drop-zone" id="drop-zone">
+        <div class="drop-zone__content">
+          <div class="drop-zone__icon">🎵</div>
+          <p class="drop-zone__text">Déposez vos fichiers<br/><span>MP3 &amp; WAV supportés</span></p>
+        </div>
+      </div>
+
+      <!-- Track list -->
+      <ul class="track-list" id="track-list" role="listbox" aria-label="Liste des pistes"></ul>
+    </aside>
+
+    <!-- ── CENTER : Waveform + Player ── -->
+    <section class="panel panel--center">
+
+      <!-- Waveform display -->
+      <div class="waveform-container" id="waveform-container">
+        <div class="waveform-idle" id="waveform-idle">
+          <span class="waveform-idle__icon">🎛️</span>
+          <p>Chargez un fichier pour voir la forme d'onde</p>
+        </div>
+        <canvas class="waveform-canvas" id="waveform-canvas"></canvas>
+        <div class="waveform-progress" id="waveform-progress"></div>
+        <div class="waveform-cursor" id="waveform-cursor"></div>
+        <div class="waveform-time-start" id="wtime-start">0:00</div>
+        <div class="waveform-time-end" id="wtime-end">0:00</div>
+      </div>
+
+      <!-- Transport bar -->
+      <div class="transport">
+        <div class="transport__left">
+          <span class="track-meta__name" id="now-playing-name">—</span>
+          <span class="track-meta__detail" id="now-playing-detail">Aucun fichier</span>
+        </div>
+
+        <div class="transport__controls">
+          <button class="ctrl-btn" id="btn-prev" title="Précédent" aria-label="Piste précédente">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+          </button>
+          <button class="ctrl-btn ctrl-btn--play" id="btn-play" title="Lecture / Pause" aria-label="Lecture">
+            <svg class="icon-play" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            <svg class="icon-pause" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+          </button>
+          <button class="ctrl-btn" id="btn-stop" title="Stop" aria-label="Stop">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+          </button>
+          <button class="ctrl-btn" id="btn-next" title="Suivant" aria-label="Piste suivante">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zm2.5-6 5.5 3.9V8.1L8.5 12zM16 6h2v12h-2z"/></svg>
+          </button>
+          <button class="ctrl-btn ctrl-btn--loop" id="btn-loop" title="Boucle" aria-label="Activer la boucle">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          </button>
+        </div>
+
+        <div class="transport__right">
+          <div class="speed-control">
+            <span class="speed-label">Speed</span>
+            <input type="range" class="speed-slider" id="speed-slider" min="0.5" max="2.0" step="0.01" value="1.0" aria-label="Playback Speed" />
+            <span class="speed-value" id="speed-value">1.0x</span>
+          </div>
+          <div class="time-display" id="time-display">0:00 / 0:00</div>
+          <div class="volume-control">
+            <svg class="vol-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
+            <input type="range" class="volume-slider" id="volume-slider" min="0" max="1" step="0.01" value="0.8" aria-label="Volume" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Progress seek bar -->
+      <div class="seek-bar-container" id="seek-bar-container" role="slider" aria-label="Position de lecture" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="seek-bar-bg"></div>
+        <div class="seek-bar-fill" id="seek-bar-fill"></div>
+        <div class="seek-bar-thumb" id="seek-bar-thumb"></div>
+      </div>
+
+    </section>
+
+    <!-- ── RIGHT PANEL : Infos & EQ placeholder ── -->
+    <aside class="panel panel--right">
+      <div class="panel__header">
+        <h2 class="panel__title">Infos</h2>
+      </div>
+      <div class="info-card" id="info-card">
+        <div class="info-idle">
+          <span>Aucune piste chargée</span>
+        </div>
+      </div>
+
+      <div class="panel__header" style="margin-top: 1.5rem;">
+        <h2 class="panel__title">Visualiseur</h2>
+      </div>
+      <canvas class="freq-canvas" id="freq-canvas"></canvas>
+    </aside>
+
+  </main>
+
+  <!-- ══════════════ STATUS BAR ══════════════ -->
+  <footer class="statusbar">
+    <span id="status-msg">Prêt — Importez un fichier MP3 ou WAV pour commencer</span>
+    <span class="statusbar__right">Web Audio API · Muse Studio</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
