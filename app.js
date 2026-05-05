@@ -131,7 +131,51 @@ const ui = {
   kickLightB:      $('kick-light-b'),
 
   statusMsg:       $('status-msg'),
+
+  // Tabs
+  navPlayer:       $('nav-player'),
+  navEditor:       $('nav-editor'),
+  playerWorkspace: $('playlist-panel').parentElement, // Main workspace
+  editorWorkspace: $('editor-workspace'),
+
+  // Editor specific
+  editorTrackList: $('editor-track-list'),
+  editorTrackName: $('editor-track-name'),
+  editorTrackInfo: $('editor-track-info'),
+  editorWaveformCanvas: $('editor-waveform-canvas'),
+  editorSelection: $('editor-selection'),
+  editorPlayhead: $('editor-playhead'),
+  editorTime: $('editor-time'),
+  editorBtnPlay: $('editor-btn-play'),
+  editorBtnCut: $('editor-btn-cut'),
+  editorBtnTrim: $('editor-btn-trim'),
+  editorBtnDelete: $('editor-btn-delete'),
+  editorBtnUndo: $('editor-btn-undo'),
+  editorBtnExport: $('editor-btn-export'),
+  editorHistoryList: $('editor-history-list'),
+  editorIdle: $('editor-idle'),
+
+  // Project persistence
+  btnSaveProject: $('btn-save-project'),
+  btnLoadProject: $('btn-load-project'),
+  projectZipInput: $('project-zip-input'),
 };
+
+// Tab Switching logic
+ui.navPlayer.addEventListener('click', () => {
+  ui.navPlayer.classList.add('active');
+  ui.navEditor.classList.remove('active');
+  ui.playerWorkspace.style.display = 'flex';
+  ui.editorWorkspace.style.display = 'none';
+});
+
+ui.navEditor.addEventListener('click', () => {
+  ui.navEditor.classList.add('active');
+  ui.navPlayer.classList.remove('active');
+  ui.playerWorkspace.style.display = 'none';
+  ui.editorWorkspace.style.display = 'flex';
+  renderEditorTrackList();
+});
 
 /* ══════════════════════════════════════
    UTILS
@@ -155,6 +199,59 @@ function setStatus(msg) {
 
 function uniqueId() {
   return Math.random().toString(36).slice(2, 9);
+}
+
+/**
+ * UTILS - WAV Encoding
+ * Converts AudioBuffer to WAV Blob
+ */
+function bufferToWav(buffer) {
+  const numOfChan = buffer.numberOfChannels,
+    length = buffer.length * numOfChan * 2 + 44,
+    bufferArr = new ArrayBuffer(length),
+    view = new DataView(bufferArr),
+    channels = [];
+  let i, sample, offset = 0, pos = 0;
+
+  // write WAVE header
+  setUint32(0x46464952);                         // "RIFF"
+  setUint32(length - 8);                         // file length - 8
+  setUint32(0x45564157);                         // "WAVE"
+  setUint32(0x20746d66);                         // "fmt " chunk
+  setUint32(16);                                 // length = 16
+  setUint16(1);                                  // PCM (uncompressed)
+  setUint16(numOfChan);
+  setUint32(buffer.sampleRate);
+  setUint32(buffer.sampleRate * 2 * numOfChan);  // avg. bytes/sec
+  setUint16(numOfChan * 2);                      // block-align
+  setUint16(16);                                 // 16-bit (hardcoded)
+  setUint32(0x61746164);                         // "data" - chunk
+  setUint32(length - pos - 4);                   // chunk length
+
+  // write interleaved data
+  for (i = 0; i < buffer.numberOfChannels; i++)
+    channels.push(buffer.getChannelData(i));
+
+  while (pos < length) {
+    for (i = 0; i < numOfChan; i++) {             // interleave channels
+      sample = Math.max(-1, Math.min(1, channels[i][offset])); // clamp
+      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit signed int
+      view.setInt16(pos, sample, true);          // write 16-bit sample
+      pos += 2;
+    }
+    offset++;                                     // next source sample
+  }
+
+  return new Blob([bufferArr], { type: "audio/wav" });
+
+  function setUint16(data) {
+    view.setUint16(pos, data, true);
+    pos += 2;
+  }
+  function setUint32(data) {
+    view.setUint32(pos, data, true);
+    pos += 4;
+  }
 }
 
 /* ══════════════════════════════════════
@@ -1705,6 +1802,468 @@ const resizeObserver = new ResizeObserver(() => {
 resizeObserver.observe(ui.waveformCanvas.parentElement);
 
 /* ══════════════════════════════════════
+   EDITOR LOGIC
+══════════════════════════════════════ */
+const editorState = {
+  currentTrackId: null,
+  selection: { start: 0, end: 0, active: false },
+  history: [], // { buffer, duration, action }
+  isPlaying: false,
+  startTime: 0,
+  startOffset: 0,
+  sourceNode: null,
+  zoom: 1.0,
+};
+
+function renderEditorTrackList() {
+  ui.editorTrackList.innerHTML = '';
+  state.tracks.forEach(track => {
+    const li = document.createElement('li');
+    li.className = `track-item ${editorState.currentTrackId === track.id ? 'active' : ''}`;
+    li.innerHTML = `
+      <div class="track-item__icon">${track.ext === 'WAV' ? '🔊' : '🎵'}</div>
+      <div class="track-item__info">
+        <div class="track-item__name">${track.name}</div>
+        <div class="track-item__meta">${formatTime(track.duration)}</div>
+      </div>
+    `;
+    li.onclick = () => loadEditorTrack(track.id);
+    ui.editorTrackList.appendChild(li);
+  });
+}
+
+function loadEditorTrack(id) {
+  const track = state.tracks.find(t => t.id === id);
+  if (!track) return;
+
+  editorState.currentTrackId = id;
+  editorState.selection = { start: 0, end: 0, active: false };
+  editorState.history = [{ buffer: track.buffer, duration: track.duration, action: 'Original' }];
+  
+  ui.editorIdle.classList.add('hidden');
+  ui.editorTrackName.textContent = track.name;
+  ui.editorTrackInfo.textContent = `${track.ext} · ${formatTime(track.duration)}`;
+  
+  renderEditorTrackList();
+  drawEditorWaveform();
+  updateEditorSelectionUI();
+  updateEditorHistoryUI();
+  
+  ui.editorBtnExport.disabled = false;
+  ui.editorBtnUndo.disabled = true;
+}
+
+function drawEditorWaveform() {
+  const track = state.tracks.find(t => t.id === editorState.currentTrackId);
+  if (!track) return;
+  
+  const buffer = editorState.history[editorState.history.length - 1].buffer;
+  drawWaveformOnCanvas({ buffer }, ui.editorWaveformCanvas, 'purple');
+}
+
+function updateEditorSelectionUI() {
+  const sel = editorState.selection;
+  if (sel.active && sel.start !== sel.end) {
+    const s = Math.min(sel.start, sel.end);
+    const e = Math.max(sel.start, sel.end);
+    
+    ui.editorSelection.style.display = 'block';
+    ui.editorSelection.style.left = `${s * 100}%`;
+    ui.editorSelection.style.width = `${(e - s) * 100}%`;
+    
+    const track = state.tracks.find(t => t.id === editorState.currentTrackId);
+    if (track) {
+      const dur = editorState.history[editorState.history.length - 1].duration;
+      ui.editorBtnCut.disabled = false;
+      ui.editorBtnTrim.disabled = false;
+      ui.editorBtnDelete.disabled = false;
+      
+      $('editor-sel-start').textContent = `Début : ${formatTime(s * dur)}`;
+      $('editor-sel-end').textContent = `Fin : ${formatTime(e * dur)}`;
+      $('editor-sel-duration').textContent = `Durée : ${formatTime((e - s) * dur)}`;
+    }
+  } else {
+    ui.editorSelection.style.display = 'none';
+    ui.editorBtnCut.disabled = true;
+    ui.editorBtnTrim.disabled = true;
+    ui.editorBtnDelete.disabled = true;
+    
+    $('editor-sel-start').textContent = `Début : --`;
+    $('editor-sel-end').textContent = `Fin : --`;
+    $('editor-sel-duration').textContent = `Durée : --`;
+  }
+}
+
+function updateEditorHistoryUI() {
+  ui.editorHistoryList.innerHTML = '';
+  editorState.history.forEach((entry, idx) => {
+    const li = document.createElement('li');
+    li.className = 'editor-history-item';
+    li.innerHTML = `
+      <span class="editor-history-item__icon">${idx === 0 ? '📄' : '✂️'}</span>
+      <span class="editor-history-item__text">${entry.action}</span>
+      <span class="editor-history-item__time">${formatTime(entry.duration)}</span>
+    `;
+    ui.editorHistoryList.prepend(li);
+  });
+}
+
+// ── EDITOR PLAYBACK ──
+function playEditorSelection() {
+  if (editorState.isPlaying) {
+    stopEditorPlayback();
+    return;
+  }
+
+  const currentBuffer = editorState.history[editorState.history.length - 1].buffer;
+  const dur = currentBuffer.duration;
+  
+  let start = 0;
+  let end = dur;
+
+  if (editorState.selection.active && editorState.selection.start !== editorState.selection.end) {
+    start = Math.min(editorState.selection.start, editorState.selection.end) * dur;
+    end = Math.max(editorState.selection.start, editorState.selection.end) * dur;
+  }
+
+  ensureAudioContext();
+  
+  editorState.sourceNode = audioCtx.createBufferSource();
+  editorState.sourceNode.buffer = currentBuffer;
+  editorState.sourceNode.connect(audioCtx.destination);
+  
+  editorState.startTime = audioCtx.currentTime;
+  editorState.startOffset = start;
+  editorState.endOffset = end;
+  
+  editorState.sourceNode.start(0, start, end - start);
+  editorState.isPlaying = true;
+  
+  ui.editorBtnPlay.querySelector('.editor-icon-play').style.display = 'none';
+  ui.editorBtnPlay.querySelector('.editor-icon-stop').style.display = 'block';
+  ui.editorPlayhead.style.display = 'block';
+  
+  editorState.sourceNode.onended = () => {
+    stopEditorPlayback();
+  };
+
+  requestAnimationFrame(updateEditorPlayhead);
+}
+
+function stopEditorPlayback() {
+  if (editorState.sourceNode) {
+    try { editorState.sourceNode.stop(); } catch(_) {}
+    editorState.sourceNode.disconnect();
+    editorState.sourceNode = null;
+  }
+  editorState.isPlaying = false;
+  ui.editorBtnPlay.querySelector('.editor-icon-play').style.display = 'block';
+  ui.editorBtnPlay.querySelector('.editor-icon-stop').style.display = 'none';
+  ui.editorPlayhead.style.display = 'none';
+}
+
+function updateEditorPlayhead() {
+  if (!editorState.isPlaying) return;
+  
+  const now = audioCtx.currentTime;
+  const elapsed = now - editorState.startTime;
+  const currentPos = editorState.startOffset + elapsed;
+  const dur = editorState.history[editorState.history.length - 1].duration;
+  
+  const ratio = Math.min(currentPos / dur, 1);
+  ui.editorPlayhead.style.left = `${ratio * 100}%`;
+  ui.editorTime.textContent = `${formatTime(currentPos)} / ${formatTime(dur)}`;
+  
+  if (currentPos < editorState.endOffset) {
+    requestAnimationFrame(updateEditorPlayhead);
+  }
+}
+
+ui.editorBtnPlay.addEventListener('click', playEditorSelection);
+
+// ── EDIT OPERATIONS (must be defined before action handlers) ──
+function applyEdit(newBuffer, action) {
+  editorState.history.push({ buffer: newBuffer, duration: newBuffer.duration, action });
+  const track = state.tracks.find(t => t.id === editorState.currentTrackId);
+  track.buffer = newBuffer;
+  track.duration = newBuffer.duration;
+  
+  ui.editorTrackInfo.textContent = `${track.ext} · ${formatTime(track.duration)}`;
+  ui.editorBtnUndo.disabled = false;
+  drawEditorWaveform();
+  updateEditorSelectionUI();
+  updateEditorHistoryUI();
+  
+  // Update main player if this track is active
+  if (state.tracks[state.currentIndex]?.id === track.id) {
+    loadTrack(state.currentIndex);
+  }
+  setStatus(`✂ ${action} appliquée — ${formatTime(newBuffer.duration)}`);
+}
+
+// ── EDITOR ACTIONS ──
+function performCut() {
+  if (!editorState.selection.active) return;
+  ensureAudioContext();
+  const currentBuffer = editorState.history[editorState.history.length - 1].buffer;
+  const dur = currentBuffer.duration;
+  const s = Math.min(editorState.selection.start, editorState.selection.end) * dur;
+  const e = Math.max(editorState.selection.start, editorState.selection.end) * dur;
+  
+  if (e - s < 0.01) return; // Too small
+  
+  const newLen = Math.max(1, Math.floor((dur - (e - s)) * currentBuffer.sampleRate));
+  const newBuffer = audioCtx.createBuffer(
+    currentBuffer.numberOfChannels, newLen, currentBuffer.sampleRate
+  );
+  
+  for (let c = 0; c < currentBuffer.numberOfChannels; c++) {
+    const oldData = currentBuffer.getChannelData(c);
+    const newData = newBuffer.getChannelData(c);
+    const splitSample = Math.floor(s * currentBuffer.sampleRate);
+    const endSample = Math.floor(e * currentBuffer.sampleRate);
+    
+    // Copy part before selection
+    for (let i = 0; i < splitSample && i < newData.length; i++) {
+      newData[i] = oldData[i];
+    }
+    // Copy part after selection
+    for (let i = endSample; i < oldData.length; i++) {
+      const destIdx = splitSample + (i - endSample);
+      if (destIdx < newData.length) newData[destIdx] = oldData[i];
+    }
+  }
+  
+  applyEdit(newBuffer, 'Coupe');
+  editorState.selection.active = false;
+  updateEditorSelectionUI();
+}
+
+function performTrim() {
+  if (!editorState.selection.active) return;
+  ensureAudioContext();
+  const currentBuffer = editorState.history[editorState.history.length - 1].buffer;
+  const dur = currentBuffer.duration;
+  const s = Math.min(editorState.selection.start, editorState.selection.end) * dur;
+  const e = Math.max(editorState.selection.start, editorState.selection.end) * dur;
+  
+  if (e - s < 0.01) return;
+  
+  const startSample = Math.floor(s * currentBuffer.sampleRate);
+  const endSample = Math.floor(e * currentBuffer.sampleRate);
+  const newLen = Math.max(1, endSample - startSample);
+  
+  const newBuffer = audioCtx.createBuffer(
+    currentBuffer.numberOfChannels, newLen, currentBuffer.sampleRate
+  );
+  
+  for (let c = 0; c < currentBuffer.numberOfChannels; c++) {
+    const oldData = currentBuffer.getChannelData(c);
+    const newData = newBuffer.getChannelData(c);
+    for (let i = 0; i < newLen; i++) {
+      newData[i] = oldData[startSample + i] || 0;
+    }
+  }
+  
+  applyEdit(newBuffer, 'Trim');
+  editorState.selection.active = false;
+  updateEditorSelectionUI();
+}
+
+function performUndo() {
+  if (editorState.history.length <= 1) return;
+  editorState.history.pop();
+  const lastEntry = editorState.history[editorState.history.length - 1];
+  const track = state.tracks.find(t => t.id === editorState.currentTrackId);
+  track.buffer = lastEntry.buffer;
+  track.duration = lastEntry.duration;
+  
+  if (editorState.history.length === 1) ui.editorBtnUndo.disabled = true;
+  drawEditorWaveform();
+  updateEditorSelectionUI();
+  updateEditorHistoryUI();
+  setStatus('↩ Modification annulée');
+}
+
+ui.editorBtnCut.addEventListener('click', performCut);
+ui.editorBtnDelete.addEventListener('click', performCut);
+ui.editorBtnTrim.addEventListener('click', performTrim);
+ui.editorBtnUndo.addEventListener('click', performUndo);
+
+// ── SELECTION INTERACTION ──
+let isDraggingEditor = false;
+ui.editorWaveformCanvas.addEventListener('mousedown', e => {
+  if (!editorState.currentTrackId) return;
+  if (editorState.isPlaying) stopEditorPlayback();
+  const rect = ui.editorWaveformCanvas.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  editorState.selection.start = x;
+  editorState.selection.end = x;
+  editorState.selection.active = true;
+  isDraggingEditor = true;
+  updateEditorSelectionUI();
+});
+
+window.addEventListener('mousemove', e => {
+  if (!isDraggingEditor) return;
+  const rect = ui.editorWaveformCanvas.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  editorState.selection.end = x;
+  updateEditorSelectionUI();
+});
+
+window.addEventListener('mouseup', () => {
+  isDraggingEditor = false;
+});
+
+/* ══════════════════════════════════════
+   PROJECT PERSISTENCE (ZIP)
+══════════════════════════════════════ */
+async function saveProject() {
+  if (state.tracks.length === 0) {
+    setStatus('⚠ Aucune piste à sauvegarder');
+    return;
+  }
+
+  const name = prompt('Nom du projet :', `Projet ${new Date().toLocaleDateString('fr-FR').replace(/\//g, '-')}`);
+  if (!name) return;
+
+  setStatus('⏳ Préparation du ZIP (encodage WAV)...');
+  
+  try {
+    const zip = new JSZip();
+    const trackMeta = [];
+    
+    // Create 'audio' folder in ZIP
+    const audioFolder = zip.folder("audio");
+
+    for (const track of state.tracks) {
+      const wavBlob = bufferToWav(track.buffer);
+      const filename = `${track.id}.wav`;
+      audioFolder.file(filename, wavBlob);
+      
+      trackMeta.push({
+        id: track.id,
+        name: track.name,
+        ext: 'WAV',
+        size: wavBlob.size,
+        duration: track.duration,
+        sampleRate: track.buffer.sampleRate,
+        channels: track.buffer.numberOfChannels,
+        detectedBPM: track.detectedBPM,
+        beatOffset: track.beatOffset,
+        filename: filename
+      });
+    }
+
+    const projectData = {
+      name,
+      savedAt: Date.now(),
+      version: "1.0",
+      settings: {
+        bpm: state.bpm,
+        volume: state.volume,
+        crossfadeDuration: state.crossfadeDuration,
+        currentIndex: state.currentIndex,
+        isLooping: state.isLooping
+      },
+      tracks: trackMeta
+    };
+
+    zip.file("project.json", JSON.stringify(projectData, null, 2));
+
+    setStatus('⏳ Génération du ZIP...');
+    const content = await zip.generateAsync({ type: "blob" });
+    
+    // Download ZIP
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(content);
+    link.download = `${name}.muse.zip`;
+    link.click();
+    
+    setStatus(`✔ Projet « ${name} » exporté en ZIP`);
+  } catch (err) {
+    console.error('Save error:', err);
+    setStatus('❌ Erreur lors de l\'export ZIP');
+  }
+}
+
+async function loadProject(file) {
+  if (!file) return;
+  
+  setStatus('⏳ Lecture du ZIP...');
+  try {
+    ensureAudioContext();
+    const zip = await JSZip.loadAsync(file);
+    const metaFile = zip.file("project.json");
+    
+    if (!metaFile) throw new Error("Fichier project.json manquant dans le ZIP");
+    
+    const meta = JSON.parse(await metaFile.async("string"));
+    
+    // Stop playback and clear state
+    stopPlayback();
+    state.tracks = [];
+    state.currentIndex = -1;
+    ui.trackList.innerHTML = '';
+    resetPlayer();
+    showWaveformIdle();
+
+    setStatus('⏳ Décodage des pistes audio...');
+    
+    for (const tMeta of meta.tracks) {
+      const audioFile = zip.file(`audio/${tMeta.filename}`);
+      if (!audioFile) continue;
+      
+      const arrayBuffer = await audioFile.async("arraybuffer");
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      
+      const track = {
+        ...tMeta,
+        buffer: audioBuffer,
+        file: null
+      };
+      
+      state.tracks.push(track);
+      renderTrackItem(track);
+    }
+
+    // Restore settings
+    const s = meta.settings;
+    state.bpm = s.bpm || 120;
+    state.volume = s.volume || 0.8;
+    state.crossfadeDuration = s.crossfadeDuration || 4;
+    state.isLooping = s.isLooping || false;
+    
+    updateBPM(state.bpm);
+    ui.volumeSlider.value = state.volume;
+    if (gainNode) gainNode.gain.value = state.volume;
+    ui.xfadeSlider.value = state.crossfadeDuration;
+    ui.xfadeValue.textContent = `${state.crossfadeDuration}s`;
+    ui.btnLoop.classList.toggle('active', state.isLooping);
+
+    if (s.currentIndex >= 0 && state.tracks.length > 0) {
+      loadTrack(s.currentIndex);
+    }
+    
+    updateActiveTrackUI();
+    setStatus(`✔ Projet « ${meta.name} » chargé avec succès`);
+  } catch (err) {
+    console.error('Load error:', err);
+    setStatus('❌ Erreur lors du chargement du ZIP');
+  }
+}
+
+// Event listeners for persistence
+ui.btnSaveProject.addEventListener('click', saveProject);
+ui.btnLoadProject.addEventListener('click', () => ui.projectZipInput.click());
+ui.projectZipInput.addEventListener('change', (e) => {
+  if (e.target.files[0]) loadProject(e.target.files[0]);
+  e.target.value = '';
+});
+
+/* ══════════════════════════════════════
    INIT
 ══════════════════════════════════════ */
-setStatus('Prêt — Importez un fichier MP3 ou WAV pour commencer');
+setStatus('Prêt — Importez un fichier ou un projet ZIP pour commencer');
+
